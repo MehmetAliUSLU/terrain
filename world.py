@@ -5,161 +5,395 @@ import numpy as np
 import numba
 import pyrr
 import ctypes
+import noise
 
-from settings import CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, CUBE_VERTICES_DATA, CUBE_INDICES
+from settings import CHUNK_WIDTH, CHUNK_DEPTH
+from history import EditAction
 
-# ... create_mesh_data fonksiyonu (değişiklik yok)
 @numba.jit(nopython=True, cache=True)
-def create_mesh_data(voxels):
-    vertex_data_list = []
+def create_heightmap_mesh(heightmap):
+    vertices = []
+    dtype = np.float32
+    # Her bir vertex artık 8 değer içerecek: X, Y, Z, NormalX, NormalY, NormalZ, U, V
     for x in range(CHUNK_WIDTH):
-        for y in range(CHUNK_HEIGHT):
-            for z in range(CHUNK_DEPTH):
-                if voxels[x, y, z] == 0:
-                    continue
-                # Ön Yüz
-                if z == CHUNK_DEPTH - 1 or voxels[x, y, z + 1] == 0:
-                    for i in range(0, 6):
-                        idx = CUBE_INDICES[i]
-                        vertex_data_list.extend([CUBE_VERTICES_DATA[idx, 0] + x, CUBE_VERTICES_DATA[idx, 1] + y, CUBE_VERTICES_DATA[idx, 2] + z, 0,0,1])
-                # Arka Yüz
-                if z == 0 or voxels[x, y, z - 1] == 0:
-                    for i in range(6, 12):
-                        idx = CUBE_INDICES[i]
-                        vertex_data_list.extend([CUBE_VERTICES_DATA[idx, 0] + x, CUBE_VERTICES_DATA[idx, 1] + y, CUBE_VERTICES_DATA[idx, 2] + z, 0,0,-1])
-                # Üst Yüz
-                if y == CHUNK_HEIGHT - 1 or voxels[x, y + 1, z] == 0:
-                    for i in range(12, 18):
-                        idx = CUBE_INDICES[i]
-                        vertex_data_list.extend([CUBE_VERTICES_DATA[idx, 0] + x, CUBE_VERTICES_DATA[idx, 1] + y, CUBE_VERTICES_DATA[idx, 2] + z, 0,1,0])
-                # Alt Yüz
-                if y == 0 or voxels[x, y - 1, z] == 0:
-                    for i in range(18, 24):
-                        idx = CUBE_INDICES[i]
-                        vertex_data_list.extend([CUBE_VERTICES_DATA[idx, 0] + x, CUBE_VERTICES_DATA[idx, 1] + y, CUBE_VERTICES_DATA[idx, 2] + z, 0,-1,0])
-                # Sağ Yüz
-                if x == CHUNK_WIDTH - 1 or voxels[x + 1, y, z] == 0:
-                    for i in range(24, 30):
-                        idx = CUBE_INDICES[i]
-                        vertex_data_list.extend([CUBE_VERTICES_DATA[idx, 0] + x, CUBE_VERTICES_DATA[idx, 1] + y, CUBE_VERTICES_DATA[idx, 2] + z, 1,0,0])
-                # Sol Yüz
-                if x == 0 or voxels[x - 1, y, z] == 0:
-                    for i in range(30, 36):
-                        idx = CUBE_INDICES[i]
-                        vertex_data_list.extend([CUBE_VERTICES_DATA[idx, 0] + x, CUBE_VERTICES_DATA[idx, 1] + y, CUBE_VERTICES_DATA[idx, 2] + z, -1,0,0])
-    return np.array(vertex_data_list, dtype=np.float32)
+        for z in range(CHUNK_DEPTH):
+            # Dört köşe noktasının pozisyonları
+            pos1 = np.array([x,     heightmap[x, z],     z],     dtype=dtype)
+            pos2 = np.array([x + 1, heightmap[x + 1, z], z],     dtype=dtype)
+            pos3 = np.array([x,     heightmap[x, z + 1], z + 1], dtype=dtype)
+            pos4 = np.array([x + 1, heightmap[x + 1, z + 1], z + 1], dtype=dtype)
+
+            # Doku koordinatları (UV)
+            uv1 = np.array([x, z], dtype=dtype)
+            uv2 = np.array([x + 1, z], dtype=dtype)
+            uv3 = np.array([x, z + 1], dtype=dtype)
+            uv4 = np.array([x + 1, z + 1], dtype=dtype)
+
+            # İki üçgen için normaller
+            vec1 = pos3 - pos1; vec2 = pos2 - pos1; normal1 = np.cross(vec1, vec2)
+            vec3 = pos4 - pos3; vec4 = pos2 - pos3; normal2 = np.cross(vec3, vec4)
+            
+            # 1. Üçgen
+            vertices.extend([pos1[0], pos1[1], pos1[2], normal1[0], normal1[1], normal1[2], uv1[0], uv1[1]])
+            vertices.extend([pos3[0], pos3[1], pos3[2], normal1[0], normal1[1], normal1[2], uv3[0], uv3[1]])
+            vertices.extend([pos2[0], pos2[1], pos2[2], normal1[0], normal1[1], normal1[2], uv2[0], uv2[1]])
+            
+            # 2. Üçgen
+            vertices.extend([pos3[0], pos3[1], pos3[2], normal2[0], normal2[1], normal2[2], uv3[0], uv3[1]])
+            vertices.extend([pos4[0], pos4[1], pos4[2], normal2[0], normal2[1], normal2[2], uv4[0], uv4[1]])
+            vertices.extend([pos2[0], pos2[1], pos2[2], normal2[0], normal2[1], normal2[2], uv2[0], uv2[1]])
+            
+    return np.array(vertices, dtype=dtype)
 
 class Chunk:
-    # ... __init__ ve build_mesh (değişiklik yok)
     def __init__(self, position):
         self.position = position
-        self.voxels = np.zeros((CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH), dtype=np.uint8)
-        self.is_dirty = True
+        self.heightmap = np.zeros((CHUNK_WIDTH + 1, CHUNK_DEPTH + 1), dtype=np.float32)
+        self.splatmap = np.zeros(( CHUNK_DEPTH + 1,CHUNK_WIDTH + 1, 3), dtype=np.float32)
+        self.splatmap_texture = None
+        self.splatmap_is_dirty = True # Başlangıçta GPU'ya yüklenmesi gerek
+        
         self.vao = None
         self.vbo = None
         self.vertex_count = 0
-    def build_mesh(self):
-        if not self.is_dirty: return
-        mesh_data = create_mesh_data(self.voxels)
-        self.vertex_count = len(mesh_data) // 6
-        if self.vertex_count == 0:
-            self.is_dirty = False
-            return
+        self.is_dirty = True
+        self.is_meshing = False
+
+    def upload_mesh_to_gpu(self, mesh_data):
+        # Bir vertex artık 8 float (32 byte)
+        self.vertex_count = len(mesh_data) // 8
+        if self.vertex_count == 0: return
+
         if self.vao is None: self.vao = glGenVertexArrays(1)
         glBindVertexArray(self.vao)
         if self.vbo is None: self.vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-        glBufferData(GL_ARRAY_BUFFER, mesh_data.nbytes, mesh_data, GL_STATIC_DRAW)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(0))
+        glBufferData(GL_ARRAY_BUFFER, mesh_data.nbytes, mesh_data, GL_DYNAMIC_DRAW)
+        
+        stride = 32 # (3+3+2) * 4 byte
+        # Konum (Location 0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
         glEnableVertexAttribArray(0)
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(12))
+        # Normal (Location 1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
         glEnableVertexAttribArray(1)
-        
-        # <<< İYİ PRATİK DÜZELTMESİ: İş bittikten sonra buffer'ı serbest bırak >>>
+        # Doku Koordinatları (Location 2)
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(24))
+        glEnableVertexAttribArray(2)
+
         glBindBuffer(GL_ARRAY_BUFFER, 0)
-        glBindVertexArray(0) # VAO'yu da burada serbest bırakmak daha temizdir
+        glBindVertexArray(0)
+
+    def upload_splatmap_to_gpu(self):
+        if self.splatmap_texture is None:
+            self.splatmap_texture = glGenTextures(1)
         
-        self.is_dirty = False
+        glActiveTexture(GL_TEXTURE3) # Başka bir doku birimi kullanalım (0,1,2 dolu)
+        glBindTexture(GL_TEXTURE_2D, self.splatmap_texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        
+        # NumPy dizisini GPU'ya yükle
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, CHUNK_WIDTH + 1, CHUNK_DEPTH + 1, 0, GL_RGB, GL_FLOAT, self.splatmap)
+        self.splatmap_is_dirty = False
+
     def draw(self, shader):
-        self.build_mesh()
-        if self.vertex_count > 0:
-            model_matrix = pyrr.matrix44.create_from_translation(self.position * CHUNK_WIDTH)
+        # Splatmap kirliyse (boyandıysa) GPU'yu güncelle
+        if self.splatmap_is_dirty:
+            self.upload_splatmap_to_gpu()
+            
+        if self.vertex_count > 0 and self.vao is not None:
+            model_matrix = pyrr.matrix44.create_from_translation(
+                pyrr.Vector3([self.position.x * CHUNK_WIDTH, 0, self.position.z * CHUNK_DEPTH])
+            )
             glUniformMatrix4fv(glGetUniformLocation(shader, "model"), 1, GL_FALSE, model_matrix)
+            
+            # Splatmap dokusunu shader'a bağla
+            glActiveTexture(GL_TEXTURE3)
+            glBindTexture(GL_TEXTURE_2D, self.splatmap_texture)
+            
             glBindVertexArray(self.vao)
             glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
-            # Bu satırın burada olması kritik önem taşıyor!
             glBindVertexArray(0)
 
-# ... World sınıfının geri kalanı (değişiklik yok)
 class World:
-    def __init__(self):
+    def __init__(self, request_queue):
         self.chunks = {}
+        self.request_queue = request_queue
         self.spawn_initial_chunks()
+        
+        
+    def get_normal_at_world_pos(self, world_x, world_z):
+        """Verilen dünya koordinatındaki yüzey normalini yaklaşık olarak hesaplar."""
+        chunk = self.get_chunk_at_world_pos(world_x, world_z)
+        if not chunk:
+            normal = pyrr.Vector3([h_l - h_r, 2.0, h_d - h_u])
+            return pyrr.vector.normalize(normal)
+
+        # Komşu piksellerin yüksekliklerini alarak eğimi hesapla
+        h_l = self.get_height_at_world_pos(world_x - 1, world_z) # Sol
+        h_r = self.get_height_at_world_pos(world_x + 1, world_z) # Sağ
+        h_d = self.get_height_at_world_pos(world_x, world_z - 1) # Aşağı
+        h_u = self.get_height_at_world_pos(world_x, world_z + 1) # Yukarı
+
+        # Yüzey normalini dikey vektörlerin çapraz çarpımından türet
+        normal = pyrr.Vector3([h_l - h_r, 2.0, h_d - h_u])
+        return pyrr.vector.normalize(normal)
+    
+    def get_chunk_at_world_pos(self, world_x, world_z):
+        """Verilen dünya koordinatındaki chunk'ı döndürür."""
+        chunk_pos_x = int(np.floor(world_x / CHUNK_WIDTH))
+        chunk_pos_z = int(np.floor(world_z / CHUNK_DEPTH))
+        return self.chunks.get((chunk_pos_x, 0, chunk_pos_z))
+
     def spawn_initial_chunks(self):
-        for x in range(-2, 3):
-            for z in range(-2, 3):
-                pos = pyrr.Vector3([x, 0, z], dtype=np.int32)
-                chunk = Chunk(pos)
-                chunk.voxels[:, :CHUNK_HEIGHT // 2, :] = 1
-                self.chunks[tuple(pos)] = chunk
-    def get_voxel_from_world_pos(self, pos):
+        chunk_pos = (0, 0, 0)
+        pos = pyrr.Vector3(chunk_pos, dtype=np.int32)
+        chunk = Chunk(pos)
+        
+        # Yükseklik haritasını oluştur (bu kısım aynı)
+        scale = 100.0; octaves = 6; persistence = 0.5; lacunarity = 2.0
+        for x in range(CHUNK_WIDTH + 1):
+            for z in range(CHUNK_DEPTH + 1):
+                world_x = pos.x * CHUNK_WIDTH + x; world_z = pos.z * CHUNK_DEPTH + z
+                noise_val = noise.pnoise2(world_x/scale, world_z/scale, octaves=octaves, persistence=persistence, lacunarity=lacunarity, base=0)
+                chunk.heightmap[x, z] = (noise_val + 1) / 2 * 6 # 6 olarak güncelledik
+
+        # Başlangıç splatmap'ini otomatik olarak oluştur
+        for x in range(CHUNK_WIDTH + 1):
+            for z in range(CHUNK_DEPTH + 1):
+                # Komşu piksellerden eğimi hesapla
+                h_dx = chunk.heightmap[min(x + 1, CHUNK_WIDTH), z] - chunk.heightmap[max(x - 1, 0), z]
+                h_dz = chunk.heightmap[x, min(z + 1, CHUNK_DEPTH)] - chunk.heightmap[x, max(z - 1, 0)]
+                normal_approx = np.array([-h_dx, 2.0, -h_dz]) # <--- This creates a numpy.ndarray
+                normal_approx /= np.linalg.norm(normal_approx)
+                slope = 1.0 - normal_approx[1] # <--- Indexing with [1] is correct for numpy
+
+                height = chunk.heightmap[x, z]
+
+                # Shader'daki kuralları burada Python'da taklit ediyoruz
+                slope_grass = 0.35; slope_rock = 0.7; height_dirt = 2.5
+                
+                dirt_blend_slope = np.clip((slope - (slope_grass - 0.1)) / 0.2, 0, 1)
+                dirt_blend_height = np.clip((height - (height_dirt - 1.0)) / 2.0, 0, 1)
+                dirt_blend = max(dirt_blend_slope, dirt_blend_height)
+                
+                grass_weight = 1.0 - dirt_blend
+                dirt_weight = dirt_blend
+
+                rock_blend = np.clip((slope - (slope_rock - 0.2)) / 0.4, 0, 1)
+                
+                # Önceki karışımı kaya ile karıştır
+                final_grass = grass_weight * (1.0 - rock_blend)
+                final_dirt = dirt_weight * (1.0 - rock_blend)
+                final_rock = rock_blend
+                
+                chunk.splatmap[z,x] = [final_grass, final_dirt, final_rock]
+
+        self.chunks[chunk_pos] = chunk
+        self.request_queue.put(chunk)
+
+    def get_height_at_world_pos(self, world_x, world_z):
         try:
-            chunk_pos = tuple(np.floor(pos / CHUNK_WIDTH).astype(int))
-            local_pos = tuple((pos % CHUNK_WIDTH).astype(int))
-            return self.chunks[chunk_pos].voxels[local_pos]
-        except (KeyError, IndexError):
-            return 0
-    def set_voxel_from_world_pos(self, pos, block_type):
-        try:
-            chunk_pos = tuple(np.floor(pos / CHUNK_WIDTH).astype(int))
-            local_pos = tuple((pos % CHUNK_WIDTH).astype(int))
-            chunk = self.chunks[chunk_pos]
-            if chunk.voxels[local_pos] == block_type: return
-            chunk.voxels[local_pos] = block_type
-            chunk.is_dirty = True
-            lx, _, lz = local_pos
-            if lx == 0: self.mark_chunk_dirty(chunk_pos[0] - 1, chunk_pos[1], chunk_pos[2])
-            if lx == CHUNK_WIDTH - 1: self.mark_chunk_dirty(chunk_pos[0] + 1, chunk_pos[1], chunk_pos[2])
-            if lz == 0: self.mark_chunk_dirty(chunk_pos[0], chunk_pos[1], chunk_pos[2] - 1)
-            if lz == CHUNK_DEPTH - 1: self.mark_chunk_dirty(chunk_pos[0], chunk_pos[1], chunk_pos[2] + 1)
-        except (KeyError, IndexError):
-            pass
-    def mark_chunk_dirty(self, cx, cy, cz):
-        pos = (cx, cy, cz)
-        if pos in self.chunks:
-            self.chunks[pos].is_dirty = True
-    def modify_voxels_in_radius(self, center_pos, brush_size, block_type):
-        if brush_size == 1:
-            self.set_voxel_from_world_pos(center_pos, block_type)
-            return
-        radius = (brush_size -1) // 2
-        for x_offset in range(-radius, radius + 1):
-            for y_offset in range(-radius, radius + 1):
-                for z_offset in range(-radius, radius + 1):
-                    target_pos = center_pos + np.array([x_offset, y_offset, z_offset])
-                    self.set_voxel_from_world_pos(target_pos, block_type)
+            chunk_pos_x = int(np.floor(world_x / CHUNK_WIDTH)); chunk_pos_z = int(np.floor(world_z / CHUNK_DEPTH))
+            chunk = self.chunks.get((chunk_pos_x, 0, chunk_pos_z))
+            if chunk is None: return 0.0
+            local_x = world_x - chunk_pos_x * CHUNK_WIDTH; local_z = world_z - chunk_pos_z * CHUNK_DEPTH
+            grid_x = int(np.floor(local_x)); grid_z = int(np.floor(local_z))
+            x_frac = local_x - grid_x; z_frac = local_z - grid_z
+            h00 = chunk.heightmap[grid_x, grid_z]; h10 = chunk.heightmap[grid_x + 1, grid_z]
+            h01 = chunk.heightmap[grid_x, grid_z + 1]; h11 = chunk.heightmap[grid_x + 1, grid_z + 1]
+            if x_frac + z_frac < 1: return h00 + (h10 - h00) * x_frac + (h01 - h00) * z_frac
+            else: return h11 + (h01 - h11) * (1 - x_frac) + (h10 - h11) * (1 - z_frac)
+        except (KeyError, IndexError): return 0.0
+
+
+    def carve_river_along_path(self, path_points, settings, action):
+        """
+        Verilen bir yol boyunca dere yatağı oyar. Bu karmaşık ve geri alınabilir
+        tek bir eylem olarak kaydedilir.
+        """
+        if len(path_points) < 2: return
+
+        width = settings["width"]
+        depth = settings["depth"]
+        smoothing = settings["smoothing"]
+        
+        # 1. Yol boyunca enterpolasyon yaparak daha sık noktalar oluştur
+        total_length = 0
+        for i in range(len(path_points) - 1):
+            total_length += np.linalg.norm(path_points[i+1] - path_points[i])
+        
+        interpolated_points = []
+        num_steps = int(total_length) # Her bir dünya biriminde bir nokta
+        for i in range(num_steps + 1):
+            progress = i / num_steps
+            
+            # Hangi segmentte olduğumuzu bul
+            current_len = 0
+            for j in range(len(path_points) - 1):
+                segment_len = np.linalg.norm(path_points[j+1] - path_points[j])
+                if current_len + segment_len >= progress * total_length:
+                    # Bu segmentteyiz
+                    segment_progress = (progress * total_length - current_len) / segment_len
+                    p1 = path_points[j]
+                    p2 = path_points[j+1]
+                    point = p1 + (p2 - p1) * segment_progress
+                    interpolated_points.append(point)
+                    break
+                current_len += segment_len
+
+        if not interpolated_points: return
+
+        # 2. Her bir enterpolasyonlu nokta etrafındaki araziyi değiştir
+        points_to_modify = {}
+        for point in interpolated_points:
+            radius = width / 2.0
+            for x in range(int(np.floor(point.x - radius)), int(np.ceil(point.x + radius))):
+                for z in range(int(np.floor(point.z - radius)), int(np.ceil(point.z + radius))):
+                    dist_sq = (x - point.x)**2 + (z - point.z)**2
+                    if dist_sq > radius**2: continue
+                    
+                    # Hedef yükseklik: yolun o anki yüksekliğinden daha derin
+                    target_height = point.y - depth
+
+                    key = (int(round(x)), int(round(z)))
+                    if key not in points_to_modify or target_height < points_to_modify[key]:
+                        points_to_modify[key] = target_height
+
+        # 3. Değişiklikleri ve yumuşatmayı uygula
+        chunk = self.chunks.get((0,0,0)) # Tek chunk varsayımı
+        if not chunk: return
+
+        for (x, z), target_h in points_to_modify.items():
+            local_x = int(round(x - chunk.position.x * CHUNK_WIDTH))
+            local_z = int(round(z - chunk.position.z * CHUNK_DEPTH))
+
+            if 0 <= local_x < CHUNK_WIDTH + 1 and 0 <= local_z < CHUNK_DEPTH + 1:
+                # Geri alma için eski verileri kaydet
+                old_h = chunk.heightmap[local_x, local_z]
+                old_s = chunk.splatmap[local_z, local_x].copy()
+
+                # Yeni yüksekliği uygula (eğer daha alçaksa)
+                new_h = min(old_h, target_h)
+                chunk.heightmap[local_x, local_z] = new_h
+
+                # Dere yatağının içini "toprak" dokusuyla boya
+                new_s = np.array([0.0, 1.0, 0.0], dtype=np.float32) # Saf toprak
+                chunk.splatmap[local_z, local_x] = old_s + (new_s - old_s) * 0.5 # Biraz karıştır
+                
+                action.record_change(local_x, local_z, old_h, new_h, old_s, chunk.splatmap[local_z, local_x].copy())
+        
+        # Kenarları yumuşat (bu ayrı bir "smooth" işlemi gibi)
+        # (Bu kısım performansı etkileyebilir ve daha da iyileştirilebilir)
+        # Şimdilik bu adımı atlayarak temel işlevselliği sağlıyoruz.
+        # Yumuşatma, değiştirilen noktaların etrafındaki komşulara bir smooth fırçası uygulamakla yapılabilir.
+
+        chunk.is_dirty = True
+        chunk.is_meshing = True
+        self.request_queue.put(chunk)
+        
+        
+    def modify_terrain(self, world_pos, brush_size, strength, tool_type, current_action, paint_index=0, target_height=None, target_normal=None, stroke_anchor_pos=None):
+        center_x, center_z = world_pos.x, world_pos.z
+        radius = brush_size / 2.0
+        affected_chunks = set()
+        
+        height_updates = []
+
+        for x in range(int(np.floor(center_x - radius)), int(np.ceil(center_x + radius))):
+            for z in range(int(np.floor(center_z - radius)), int(np.ceil(center_z + radius))):
+                dist_sq = (x - center_x)**2 + (z - center_z)**2
+                if dist_sq > radius**2: continue
+                
+                chunk = self.get_chunk_at_world_pos(x, z)
+                if not chunk or chunk != current_action.chunk: continue
+
+                local_x = int(round(x - chunk.position.x * CHUNK_WIDTH))
+                local_z = int(round(z - chunk.position.z * CHUNK_DEPTH))
+
+                if 0 <= local_x < CHUNK_WIDTH + 1 and 0 <= local_z < CHUNK_DEPTH + 1:
+                    falloff = 1.0 - (dist_sq / radius**2)
+                    
+                    # Değişiklikten önceki değerleri al
+                    old_h = chunk.heightmap[local_x, local_z]
+                    old_s = chunk.splatmap[local_z, local_x].copy()
+                    
+                    new_h, new_s = old_h, old_s
+
+                    if tool_type == "paint":
+                        target_weights = np.zeros(3); target_weights[paint_index] = 1.0
+                        new_weights = old_s + (target_weights - old_s) * strength * falloff
+                        new_s = new_weights / np.sum(new_weights)
+                        chunk.splatmap[local_z, local_x] = new_s
+                        chunk.splatmap_is_dirty = True
+                    
+                    elif tool_type == "raise":
+                        new_h = old_h + strength * falloff
+                        chunk.heightmap[local_x, local_z] = new_h
+                    
+                    elif tool_type == "lower":
+                        new_h = old_h - strength * falloff
+                        chunk.heightmap[local_x, local_z] = new_h
+
+                    elif tool_type == "flatten":
+                        if target_height is None: continue
+                        new_h = old_h + (target_height - old_h) * falloff * strength
+                        chunk.heightmap[local_x, local_z] = new_h
+                    
+                    elif tool_type == "smooth":
+                        total_height = 0; neighbor_count = 0
+                        for dx in range(-1, 2):
+                            for dz in range(-1, 2):
+                                nx, nz = local_x + dx, local_z + dz
+                                if 0 <= nx < CHUNK_WIDTH + 1 and 0 <= nz < CHUNK_DEPTH + 1:
+                                    total_height += chunk.heightmap[nx, nz]; neighbor_count += 1
+                        if neighbor_count > 0:
+                            average_height = total_height / neighbor_count
+                            new_h_calc = old_h + (average_height - old_h) * strength * falloff
+                            height_updates.append((chunk, local_x, local_z, old_h, new_h_calc))
+                    elif tool_type in ("slope", "memory_slope"):
+                        # Parametre isimlerini yeni mantığa göre kullan
+                        if target_normal is not None and stroke_anchor_pos is not None and target_normal[1] != 0:
+                            target_y = stroke_anchor_pos[1] - \
+                                (target_normal[0] * (x - stroke_anchor_pos[0]) + \
+                                 target_normal[2] * (z - stroke_anchor_pos[2])) / target_normal[1]
+                            
+                            new_h = old_h + (target_y - old_h) * strength * falloff
+                            chunk.heightmap[local_x, local_z] = new_h
+                            
+                            
+                    if tool_type != "smooth":
+                        current_action.record_change(local_x, local_z, old_h, new_h, old_s, new_s)
+                    
+                    affected_chunks.add(chunk)
+
+        if tool_type == "smooth":
+            for chunk, lx, lz, old_h_smooth, new_h_smooth in height_updates:
+                chunk.heightmap[lx, lz] = new_h_smooth
+                old_s_smooth = chunk.splatmap[lz, lx].copy()
+                current_action.record_change(lx, lz, old_h_smooth, new_h_smooth, old_s_smooth, old_s_smooth)
+
+        for chunk in affected_chunks:
+            if tool_type != "paint" and not chunk.is_meshing:
+                chunk.is_dirty = True; chunk.is_meshing = True; self.request_queue.put(chunk)
+
     def draw(self, shader):
         for chunk in self.chunks.values():
             chunk.draw(shader)
-    def raycast(self, start, direction, max_dist=30):
-        pos = np.floor(start).astype(int)
-        step = np.sign(direction).astype(int)
-        direction_safe = direction.copy()
-        direction_safe[direction_safe == 0] = 1e-6
-        t_delta = abs(1.0 / direction_safe)
-        t_max = (np.sign(direction) * (np.floor(start) - start) + (np.sign(direction) * 0.5 + 0.5)) * t_delta
-        prev_pos = None
-        for _ in range(int(max_dist * 2)):
-            if self.get_voxel_from_world_pos(pos) != 0:
-                return tuple(pos), tuple(prev_pos) if prev_pos is not None else None
-            prev_pos = pos.copy()
-            if t_max[0] < t_max[1] and t_max[0] < t_max[2]:
-                t_max[0] += t_delta[0]
-                pos[0] += step[0]
-            elif t_max[1] < t_max[2]:
-                t_max[1] += t_delta[1]
-                pos[1] += step[1]
-            else:
-                t_max[2] += t_delta[2]
-                pos[2] += step[2]
-        return None, None
+            
+    def raycast_terrain(self, ray_origin, ray_direction, max_dist=200):
+        current_pos = ray_origin.copy()
+        # <<< DEĞİŞİKLİK: Adım boyutunu küçülterek hassasiyeti artır >>>
+        step_size = 0.2
+        for _ in range(int(max_dist / step_size)):
+            terrain_height = self.get_height_at_world_pos(current_pos.x, current_pos.z)
+            if current_pos.y < terrain_height:
+                # <<< DEĞİŞİKLİK: İmleci yüzeyin çok az üzerine yerleştir (Z-fighting önlemi) >>>
+                current_pos.y = terrain_height + 0.1
+                return current_pos
+            current_pos += ray_direction * step_size
+        return None
+

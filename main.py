@@ -7,133 +7,465 @@ from OpenGL.GL.shaders import compileProgram, compileShader
 import numpy as np
 import pyrr
 import sys
+import threading
+import queue
+import os
+from PIL import Image
 
 import imgui
 from imgui.integrations.pygame import PygameRenderer
 
-from settings import SCREEN_WIDTH, SCREEN_HEIGHT, VERTEX_SHADER, FRAGMENT_SHADER
+from settings import SCREEN_WIDTH, SCREEN_HEIGHT, VERTEX_SHADER, FRAGMENT_SHADER, CURSOR_VERTEX_SHADER, CURSOR_FRAGMENT_SHADER
 from camera import Camera
 from world import World
 from editor import Editor
+from history import UndoManager, EditAction
+
+def mesh_worker(request_queue, result_queue):
+    from world import create_heightmap_mesh # Numba'nın thread-safe olması için import'u buraya alıyoruz
+    while True:
+        try:
+            chunk = request_queue.get(timeout=2)
+            if chunk is None: break
+            mesh_data = create_heightmap_mesh(chunk.heightmap)
+            result_queue.put((chunk, mesh_data))
+        except queue.Empty: continue
 
 class App:
     def __init__(self):
         pygame.init()
-        self.window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), DOUBLEBUF | OPENGL | RESIZABLE)
-
+        self.screen_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.window = pygame.display.set_mode(self.screen_size, DOUBLEBUF | OPENGL | RESIZABLE)
         imgui.create_context()
         self.renderer = PygameRenderer()
         self.io = imgui.get_io()
-        self.io.display_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
-
+        self.io.display_size = self.screen_size
         pygame.mouse.set_visible(True)
         pygame.event.set_grab(False)
+        
+        self.shader = self.create_shader_program(VERTEX_SHADER, FRAGMENT_SHADER)
+        self.cursor_shader = self.create_shader_program(CURSOR_VERTEX_SHADER, CURSOR_FRAGMENT_SHADER)
 
-        self.shader = self.create_shader_program()
+        self.undo_manager = UndoManager()
+        self.current_action = None # O an devam eden eylemi tutar
+
+        self.texture_ids = {}
+        self.texture_units = {}
+        self.load_textures()
+        self.slope_target_normal = None
+        self.slope_initial_pos = None
+        
+        # Hafızada kalıcı olarak saklanan, kopyalanmış eğim yönü
+        self.slope_memory_normal = None
+        # Sadece o anki fırça darbesi için geçerli olan başlangıç noktası
+        self.stroke_start_pos = None
+        
+        # YENİ: Dere Yatağı yolu için değişkenler
+        self.river_path_points = []
+        self.river_path_vao = None
+        self.river_path_vbo = None
+
         self.camera = Camera()
-        self.world = World()
+        self.meshing_request_queue = queue.Queue()
+        self.meshing_result_queue = queue.Queue()
+        self.world = World(self.meshing_request_queue)
+        self.worker_thread = threading.Thread(target=mesh_worker, args=(self.meshing_request_queue, self.meshing_result_queue), daemon=True)
+        self.worker_thread.start()
         self.editor = Editor()
         self.clock = pygame.time.Clock()
+        
+        self.flatten_target_height = None
+        self.camera_orbiting = False
+        self.camera_panning = False
+        
+        self.cursor_pos = None
+        self.setup_cursor()
 
-        self.setup_uniforms()
+        self.dynamic_preview_vao = None
+        self.dynamic_preview_vbo = None
+        self.dynamic_preview_ebo = None
+        self.dynamic_preview_index_count = 0
+        self.setup_dynamic_preview_objects()
 
-    def create_shader_program(self):
-        return compileProgram(compileShader(VERTEX_SHADER, GL_VERTEX_SHADER), compileShader(FRAGMENT_SHADER, GL_FRAGMENT_SHADER))
+    def create_shader_program(self, vertex_src, fragment_src):
+        return compileProgram(compileShader(vertex_src, GL_VERTEX_SHADER), compileShader(fragment_src, GL_FRAGMENT_SHADER))
 
-    def setup_uniforms(self):
-        glUseProgram(self.shader)
-        projection = pyrr.matrix44.create_perspective_projection_matrix(45, SCREEN_WIDTH / SCREEN_HEIGHT, 0.1, 500)
-        glUniformMatrix4fv(glGetUniformLocation(self.shader, "projection"), 1, GL_FALSE, projection)
-        glUniform3f(glGetUniformLocation(self.shader, "lightPos"), 50, 100, 50)
-        glUniform3f(glGetUniformLocation(self.shader, "lightColor"), 1.0, 1.0, 1.0)
-        glUseProgram(0)
+    def load_textures(self):
+        texture_names = ["grass", "dirt", "rock"]
+        for i, name in enumerate(texture_names):
+            texture_id = glGenTextures(1)
+            glActiveTexture(GL_TEXTURE0 + i)
+            glBindTexture(GL_TEXTURE_2D, texture_id)
+            
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+            try:
+                img_path = os.path.join("textures", f"{name}.png")
+                img = Image.open(img_path).convert("RGBA")
+                img_data = np.array(list(img.getdata()), np.uint8)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width, img.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+                glGenerateMipmap(GL_TEXTURE_2D)
+                
+                self.texture_ids[name] = texture_id
+                self.texture_units[name] = i
+            except FileNotFoundError:
+                print(f"UYARI: Doku dosyası bulunamadı: {img_path}")
+        
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+    def setup_cursor(self):
+        vertices = np.array([-0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5], dtype=np.float32)
+        indices = np.array([0,1,2,2,3,0, 4,5,6,6,7,4, 0,3,7,7,4,0, 1,2,6,6,5,1, 0,1,5,5,4,0, 3,2,6,6,7,3], dtype=np.uint32)
+        self.cursor_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.cursor_vao)
+        vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo); glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+        ebo = glGenBuffers(1); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo); glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0)); glEnableVertexAttribArray(0)
+        glBindVertexArray(0)
+
+    def setup_dynamic_preview_objects(self):
+        segments = 32
+        indices = []
+        for i in range(segments):
+            indices.extend([0, i + 1, ((i + 1) % segments) + 1])
+        
+        indices = np.array(indices, dtype=np.uint32)
+        self.dynamic_preview_index_count = len(indices)
+
+        self.dynamic_preview_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.dynamic_preview_vao)
+        
+        self.dynamic_preview_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.dynamic_preview_vbo)
+        glBufferData(GL_ARRAY_BUFFER, 0, None, GL_DYNAMIC_DRAW)
+        
+        self.dynamic_preview_ebo = glGenBuffers(1)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.dynamic_preview_ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+        
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glBindVertexArray(0)
+
+    def setup_river_path_renderer(self):
+        """Yol çizgisini renderlamak için gerekli VBO ve VAO'yu hazırlar."""
+        self.river_path_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.river_path_vao)
+        
+        self.river_path_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.river_path_vbo)
+        # Veri sürekli değişeceği için DYNAMIC_DRAW kullanıyoruz
+        glBufferData(GL_ARRAY_BUFFER, 0, None, GL_DYNAMIC_DRAW)
+        
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        
+        glBindVertexArray(0)
+
+    def update_river_path_vbo(self):
+        """Yol noktalarını GPU'ya gönderir."""
+        if not self.river_path_points:
+            return
+        
+        # Noktaları GPU'ya göndermek için uygun formata getir
+        vertices = np.array(self.river_path_points, dtype=np.float32)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, self.river_path_vbo)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
 
     def run(self):
         while True:
             dt = self.clock.tick(60) / 1000.0
-            
-            if self.handle_events_and_inputs(dt) is False:
-                break
-            
+            if self.handle_events_and_inputs(dt) is False: break
+            self.process_meshing_results()
             self.render_scene()
-
         self.quit()
 
+    def process_meshing_results(self):
+        try:
+            while True:
+                chunk, mesh_data = self.meshing_result_queue.get_nowait()
+                chunk.upload_mesh_to_gpu(mesh_data)
+                chunk.is_meshing = False
+                chunk.is_dirty = False
+        except queue.Empty: pass
+
     def handle_events_and_inputs(self, dt):
-        self.renderer.process_inputs()
+        # --- 1. Adım: Olay İşleme Döngüsü ---
+        # Önce tüm Pygame olaylarını işleyip ImGui'ye bildiriyoruz.
+        # Bu, io.key_ctrl gibi durumların güncellenmesini sağlar.
+        # Sadece bir kez tetiklenmesi gereken eylemler (tuşa basma anı gibi) burada ele alınır.
         for event in pygame.event.get():
             if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                self.meshing_request_queue.put(None)
                 return False
             
             self.renderer.process_event(event)
-
-            if event.type == VIDEORESIZE:
+            
+            if event.type == VIDEORESIZE: 
+                self.screen_size = (event.w, event.h)
                 glViewport(0, 0, event.w, event.h)
-                self.io.display_size = (event.w, event.h)
+                self.io.display_size = self.screen_size
+            
+            # Geri Alma/Yineleme (Ctrl+Z/Y basılma anı)
+            if event.type == pygame.KEYDOWN:
+                if self.io.key_ctrl and event.key == pygame.K_z:
+                    self.undo_manager.undo()
+                    for chunk in self.world.chunks.values():
+                        if chunk.is_dirty and not chunk.is_meshing:
+                            chunk.is_meshing = True
+                            self.meshing_request_queue.put(chunk)
+                if self.io.key_ctrl and event.key == pygame.K_y:
+                    self.undo_manager.redo()
+                    for chunk in self.world.chunks.values():
+                        if chunk.is_dirty and not chunk.is_meshing:
+                            chunk.is_meshing = True
+                            self.meshing_request_queue.put(chunk)
 
+            # Fare girdilerini sadece ImGui kullanmıyorsa işle
             if not self.io.want_capture_mouse:
+                if event.type == pygame.MOUSEWHEEL:
+                    inversion_settings = self.editor.get_inversion_settings()
+                    self.camera.process_zoom(event.y, inversion_settings["zoom"])
+                
                 if event.type == pygame.MOUSEBUTTONDOWN:
-                    hit_pos, prev_pos = self.world.raycast(self.camera.position, self.camera.front)
-                    if event.button == 1 and hit_pos:
-                        self.world.modify_voxels_in_radius(np.array(hit_pos), self.editor.brush_size, 0)
-                    if event.button == 3 and prev_pos:
-                        self.world.modify_voxels_in_radius(np.array(prev_pos), self.editor.brush_size, self.editor.selected_block_id)
+                    if event.button == 2:  # Orta fare tuşu
+                        if self.io.key_ctrl:
+                            self.camera_panning = True
+                        else:
+                            self.camera_orbiting = True
+                        pygame.mouse.get_rel()  # Göreceli hareketi sıfırla
+                    
+                    projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
+                    ray_params = self.camera.get_ray_from_mouse(pygame.mouse.get_pos(), self.screen_size[0], self.screen_size[1], projection_matrix)
+                    cursor_pos = self.world.raycast_terrain(*ray_params)
+                    
+                    if cursor_pos is not None:
+                        selected_tool = self.editor.get_selected_tool()
+                        
+                        # Sol Tık Olayları
+                        if event.button == 1:
+                            if selected_tool == "river":
+                                point_to_add = cursor_pos + pyrr.Vector3([0, 0.2, 0])
+                                self.river_path_points.append(point_to_add)
+                                self.update_river_path_vbo()
+                            elif selected_tool == "memory_slope" and self.io.key_ctrl:
+                                self.slope_memory_normal = self.world.get_normal_at_world_pos(cursor_pos.x, cursor_pos.z)
+                                print(f"Eğim Kopyalandı! Normal: {self.slope_memory_normal}")
+                            else:
+                                chunk = self.world.get_chunk_at_world_pos(cursor_pos.x, cursor_pos.z)
+                                if chunk: self.current_action = EditAction(chunk)
+                                self.stroke_start_pos = cursor_pos
+                                if selected_tool == "flatten":
+                                    self.flatten_target_height = cursor_pos.y - 0.1
 
+                        # Sağ Tık Olayları
+                        if event.button == 3:
+                            if selected_tool == "memory_slope" and self.io.key_ctrl:
+                                self.slope_memory_normal = None
+                                print("Kopyalanan eğim sıfırlandı.")
+
+                if event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 2:  # Orta fare tuşu
+                        self.camera_orbiting = False
+                        self.camera_panning = False
+                    if event.button == 1:
+                        if self.current_action:
+                            self.undo_manager.register_action(self.current_action)
+                            self.current_action = None
+                        self.flatten_target_height = None
+                        self.stroke_start_pos = None
+
+        # --- 2. Adım: Durum Tabanlı İşlemler (Olay döngüsünden sonra) ---
+        # Bu çağrı, olay döngüsünden SONRA ve new_frame'den ÖNCE olmalıdır.
+        # Klavye ve farenin anlık durumunu ImGui'ye bildirir.
+        self.renderer.process_inputs()
+
+        # --- 3. Adım: ImGui Çerçevesini Başlat ---
+        # Artık ImGui'nin girdi durumu tutarlı olduğu için yeni bir çerçeve başlatabiliriz.
+        imgui.new_frame()
+        
+        # --- 4. Adım: Arayüzü Çiz ---
+        ui_action = self.editor.draw_ui()
+
+        # Arayüzden gelen buton eylemlerini işle
+        if ui_action == "clear_river_path":
+            self.river_path_points.clear()
+            self.update_river_path_vbo()
+        elif ui_action == "carve_river":
+            if len(self.river_path_points) > 1:
+                chunk = self.world.chunks.get((0,0,0)) # Tek chunk varsayımı
+                if chunk:
+                    action = EditAction(chunk)
+                    self.world.carve_river_along_path(self.river_path_points, self.editor.get_river_settings(), action)
+                    self.undo_manager.register_action(action)
+                    self.river_path_points.clear()
+                    self.update_river_path_vbo()
+
+        # --- 5. Adım: Sürekli Devam Eden Eylemler ---
+        # Arayüz odağı almadıysa, tuş basılı tutulduğunda devam eden eylemleri gerçekleştir.
         if not self.io.want_capture_mouse:
-            keys = pygame.key.get_pressed()
-            self.camera.process_keyboard_input(keys, dt)
-            if pygame.mouse.get_pressed()[2]:
-                if not pygame.event.get_grab(): pygame.event.set_grab(True)
+            mouse_pos = pygame.mouse.get_pos()
+            mouse_pressed = pygame.mouse.get_pressed()
+            projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
+
+            self.cursor_pos = self.world.raycast_terrain(*self.camera.get_ray_from_mouse(mouse_pos, self.screen_size[0], self.screen_size[1], projection_matrix))
+
+            # Sol fare tuşu basılı tutulurken araziyi değiştir
+            if mouse_pressed[0] and self.cursor_pos is not None and self.current_action:
+                current_normal_to_use = None
+                selected_tool = self.editor.get_selected_tool()
+
+                if selected_tool == "slope" and self.stroke_start_pos is not None:
+                    current_normal_to_use = self.world.get_normal_at_world_pos(self.stroke_start_pos.x, self.stroke_start_pos.z)
+                elif selected_tool == "memory_slope":
+                    current_normal_to_use = self.slope_memory_normal
+
+                self.world.modify_terrain(
+                    self.cursor_pos, self.editor.brush_size, self.editor.brush_strength, 
+                    selected_tool, current_action=self.current_action, 
+                    paint_index=self.editor.get_paint_texture_index(), target_height=self.flatten_target_height,
+                    target_normal=current_normal_to_use, stroke_anchor_pos=self.stroke_start_pos
+                )
+
+            # Orta fare tuşu basılı tutulurken kamerayı hareket ettir
+            if self.camera_orbiting or self.camera_panning:
                 mouse_rel = pygame.mouse.get_rel()
-                self.camera.process_mouse_movement(mouse_rel[0], mouse_rel[1])
-            else:
-                if pygame.event.get_grab(): pygame.event.set_grab(False)
+                inversion_settings = self.editor.get_inversion_settings()
+                if self.camera_orbiting:
+                    self.camera.process_orbit(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
+                elif self.camera_panning:
+                    self.camera.process_pan(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
+            
         return True
 
     def render_scene(self):
-        glClearColor(0.5, 0.7, 1.0, 1.0)
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-
-        # --- AŞAMA 1: 3D DÜNYA ÇİZİMİ ---
-        glEnable(GL_DEPTH_TEST)
-        glEnable(GL_CULL_FACE)
-        glDisable(GL_BLEND)
-
-        glUseProgram(self.shader)
-        
+        glClearColor(0.5, 0.7, 1.0, 1.0); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         view_matrix = self.camera.get_view_matrix()
+        projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
+        
+        # --- Ana Arazi Çizimi ---
+        glEnable(GL_DEPTH_TEST); glEnable(GL_CULL_FACE); glDisable(GL_BLEND)
+        glUseProgram(self.shader)
+
+        for name, unit in self.texture_units.items():
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, self.texture_ids[name])
+
+        glUniform1i(glGetUniformLocation(self.shader, "texture_grass"), self.texture_units.get("grass", 0))
+        glUniform1i(glGetUniformLocation(self.shader, "texture_dirt"), self.texture_units.get("dirt", 1))
+        glUniform1i(glGetUniformLocation(self.shader, "texture_rock"), self.texture_units.get("rock", 2))
+        # YENİ: Splatmap doku birimini shader'a bildir
+        glUniform1i(glGetUniformLocation(self.shader, "texture_splatmap"), 3) # 3. birimi kullandık
+
+        glUniformMatrix4fv(glGetUniformLocation(self.shader, "projection"), 1, GL_FALSE, projection_matrix)
         glUniformMatrix4fv(glGetUniformLocation(self.shader, "view"), 1, GL_FALSE, view_matrix)
         glUniform3fv(glGetUniformLocation(self.shader, "viewPos"), 1, self.camera.position)
+        glUniform3f(glGetUniformLocation(self.shader, "lightPos"), 50, 100, 50)
+        glUniform3f(glGetUniformLocation(self.shader, "lightColor"), 1.0, 1.0, 1.0)
         
         self.world.draw(self.shader)
 
-        # --- AŞAMA 2: OPENGL DURUMUNU TAMAMEN TEMİZLEME ---
-        # <<< KRITIK DÜZELTME 1: Shader programını serbest bırak >>>
+        for unit in self.texture_units.values():
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, 0)
+
+        # --- İmleç ve Fırça Önizlemesi Çizimi ---
+        if self.cursor_pos is not None:
+            glDisable(GL_CULL_FACE); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE)
+            
+            glUseProgram(self.cursor_shader)
+            
+            model_loc = glGetUniformLocation(self.cursor_shader, "model")
+            view_loc = glGetUniformLocation(self.cursor_shader, "view")
+            proj_loc = glGetUniformLocation(self.cursor_shader, "projection")
+            color_loc = glGetUniformLocation(self.cursor_shader, "u_color")
+
+            glUniformMatrix4fv(view_loc, 1, GL_FALSE, view_matrix)
+            glUniformMatrix4fv(proj_loc, 1, GL_FALSE, projection_matrix)
+
+            # 1. Araziye Uygun Fırça Önizlemesini Oluştur ve Çiz
+            glUniformMatrix4fv(model_loc, 1, GL_FALSE, pyrr.matrix44.create_identity())
+            glUniform4f(color_loc, 1.0, 1.0, 0.0, 0.5)
+
+            segments = 32
+            radius = self.editor.brush_size / 2.0
+            vertices = []
+            center_x, center_z = self.cursor_pos.x, self.cursor_pos.z
+            center_y = self.world.get_height_at_world_pos(center_x, center_z) + 0.05
+            vertices.extend([center_x, center_y, center_z])
+            
+            for i in range(segments):
+                angle = i * (2 * np.pi / segments)
+                world_x = center_x + np.cos(angle) * radius
+                world_z = center_z + np.sin(angle) * radius
+                world_y = self.world.get_height_at_world_pos(world_x, world_z) + 0.05
+                vertices.extend([world_x, world_y, world_z])
+            
+            vertices = np.array(vertices, dtype=np.float32)
+            
+            glBindVertexArray(self.dynamic_preview_vao)
+            glBindBuffer(GL_ARRAY_BUFFER, self.dynamic_preview_vbo)
+            glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
+            glDrawElements(GL_TRIANGLES, self.dynamic_preview_index_count, GL_UNSIGNED_INT, None)
+            glBindVertexArray(0)
+
+            # 2. Merkez İmleci (Küp) Çiz
+            cursor_model_matrix = (pyrr.matrix44.create_from_scale([0.2, 0.2, 0.2]) @ pyrr.matrix44.create_from_translation(self.cursor_pos))
+            glUniformMatrix4fv(model_loc, 1, GL_FALSE, cursor_model_matrix)
+            glUniform4f(color_loc, 1.0, 0.0, 0.0, 0.8)
+
+            glBindVertexArray(self.cursor_vao)
+            glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, None)
+            glBindVertexArray(0)
+            
+            glDepthMask(GL_TRUE); glEnable(GL_CULL_FACE)
+
+        if self.editor.get_selected_tool() == "river" and len(self.river_path_points) > 1:
+            glUseProgram(self.cursor_shader) # İmlecin shader'ını kullanabiliriz
+            
+            # Uniform'ları tekrar ayarla
+            glUniformMatrix4fv(glGetUniformLocation(self.cursor_shader, "model"), 1, GL_FALSE, pyrr.matrix44.create_identity())
+            glUniformMatrix4fv(glGetUniformLocation(self.cursor_shader, "view"), 1, GL_FALSE, view_matrix)
+            glUniformMatrix4fv(glGetUniformLocation(self.cursor_shader, "projection"), 1, GL_FALSE, projection_matrix)
+            glUniform4f(glGetUniformLocation(self.cursor_shader, "u_color"), 0.0, 0.5, 1.0, 0.8) # Mavi bir renk
+
+            glLineWidth(3.0) # Çizgi kalınlığı
+            glBindVertexArray(self.river_path_vao)
+            glDrawArrays(GL_LINE_STRIP, 0, len(self.river_path_points))
+            glBindVertexArray(0)
+            glLineWidth(1.0) # Kalınlığı sıfırla
+
+
         glUseProgram(0)
-        # <<< KRITIK DÜZELTME 2: Aktif buffer'ları serbest bırak >>>
         glBindBuffer(GL_ARRAY_BUFFER, 0)
-        # VAO zaten world.py içinde serbest bırakılıyor (glBindVertexArray(0))
-
-        # --- AŞAMA 3: 2D ARAYÜZ (IMGUI) ÇİZİMİ ---
-        glDisable(GL_DEPTH_TEST)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
+        glBindVertexArray(0)
         glDisable(GL_CULL_FACE)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_DEPTH_TEST)
+        # Aktif doku biriminin de sıfırlandığından emin olalım
+        glActiveTexture(GL_TEXTURE0)
 
-        imgui.new_frame()
-        self.editor.draw_ui()
+        # --- ImGui Arayüz Çizimi ---
+
         imgui.render()
         self.renderer.render(imgui.get_draw_data())
-
-        # --- AŞAMA 4: EKRANI GÜNCELLE ---
+        
         pygame.display.flip()
         pygame.display.set_caption(f"Voxel Editor - FPS: {self.clock.get_fps():.2f}")
     
     def quit(self):
+        self.worker_thread.join()
         self.renderer.shutdown()
         pygame.quit()
         sys.exit()
 
 if __name__ == "__main__":
     app = App()
+    app.setup_river_path_renderer()
     app.run()

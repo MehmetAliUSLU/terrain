@@ -1,0 +1,8 @@
+pygame
+PyOpenGL
+numpy
+pyrr
+noise
+numba
+Pillow
+imgui[pygame]
