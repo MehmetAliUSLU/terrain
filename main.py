@@ -62,8 +62,10 @@ class App:
         
         # YENİ: Dere Yatağı yolu için değişkenler
         self.river_path_points = []
+        self.draped_path_vertices = [] # YENİ: Araziye giydirilmiş görsel yol
         self.river_path_vao = None
         self.river_path_vbo = None
+
 
         self.camera = Camera()
         self.meshing_request_queue = queue.Queue()
@@ -86,6 +88,46 @@ class App:
         self.dynamic_preview_ebo = None
         self.dynamic_preview_index_count = 0
         self.setup_dynamic_preview_objects()
+
+
+    def generate_draped_path_vertices(self):
+        """
+        Ana yol noktalarından araziye giydirilmiş, detaylı bir görsel yol oluşturur.
+        """
+        if len(self.river_path_points) < 2:
+            return []
+
+        detailed_points = []
+        # Her bir segmenti (iki ana nokta arası) ayrı ayrı işle
+        for i in range(len(self.river_path_points) - 1):
+            p1 = self.river_path_points[i]
+            p2 = self.river_path_points[i+1]
+
+            segment_vector = p2 - p1
+            distance = np.linalg.norm(segment_vector)
+            if distance == 0:
+                continue
+
+            # Mesafe ne kadar uzunsa, o kadar çok ara nokta oluştur (örneğin her birimde bir nokta)
+            num_steps = int(distance) + 1
+
+            for step in range(num_steps + 1):
+                t = step / num_steps
+                # XZ düzleminde ara noktayı hesapla
+                interp_point_xz = p1 + t * segment_vector
+
+                # Ara noktanın bulunduğu yerdeki arazi yüksekliğini al
+                terrain_y = self.world.get_height_at_world_pos(interp_point_xz.x, interp_point_xz.z)
+
+                # Nihai 3D noktayı oluştur ve Z-fighting olmaması için biraz yükselt
+                final_point = pyrr.Vector3([interp_point_xz.x, terrain_y + 0.2, interp_point_xz.z])
+                
+                # Başlangıç noktası hariç diğerlerini ekle (çakışmayı önlemek için)
+                if step > 0 or i == 0:
+                    detailed_points.append(final_point)
+        
+        return detailed_points
+    
 
     def create_shader_program(self, vertex_src, fragment_src):
         return compileProgram(compileShader(vertex_src, GL_VERTEX_SHADER), compileShader(fragment_src, GL_FRAGMENT_SHADER))
@@ -166,13 +208,17 @@ class App:
         
         glBindVertexArray(0)
 
-    def update_river_path_vbo(self):
+    def update_river_path_vbo(self, path_data):
         """Yol noktalarını GPU'ya gönderir."""
-        if not self.river_path_points:
+        if not path_data:
+            # VBO'yu temizle
+            glBindBuffer(GL_ARRAY_BUFFER, self.river_path_vbo)
+            glBufferData(GL_ARRAY_BUFFER, 0, None, GL_DYNAMIC_DRAW)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
             return
         
         # Noktaları GPU'ya göndermek için uygun formata getir
-        vertices = np.array(self.river_path_points, dtype=np.float32)
+        vertices = np.array(path_data, dtype=np.float32)
         
         glBindBuffer(GL_ARRAY_BUFFER, self.river_path_vbo)
         glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
@@ -253,7 +299,9 @@ class App:
                             if selected_tool == "river":
                                 point_to_add = cursor_pos + pyrr.Vector3([0, 0.2, 0])
                                 self.river_path_points.append(point_to_add)
-                                self.update_river_path_vbo()
+                                # DEĞİŞİKLİK: Detaylı yolu yeniden oluştur ve VBO'yu güncelle
+                                self.draped_path_vertices = self.generate_draped_path_vertices()
+                                self.update_river_path_vbo(self.draped_path_vertices)
                             elif selected_tool == "memory_slope" and self.io.key_ctrl:
                                 self.slope_memory_normal = self.world.get_normal_at_world_pos(cursor_pos.x, cursor_pos.z)
                                 print(f"Eğim Kopyalandı! Normal: {self.slope_memory_normal}")
@@ -296,16 +344,21 @@ class App:
         # Arayüzden gelen buton eylemlerini işle
         if ui_action == "clear_river_path":
             self.river_path_points.clear()
-            self.update_river_path_vbo()
+            # DEĞİŞİKLİK: Detaylı yolu da temizle
+            self.draped_path_vertices.clear()
+            self.update_river_path_vbo(self.draped_path_vertices)
         elif ui_action == "carve_river":
             if len(self.river_path_points) > 1:
                 chunk = self.world.chunks.get((0,0,0)) # Tek chunk varsayımı
                 if chunk:
                     action = EditAction(chunk)
+                    # Dere oyma işlemi ana noktaları kullanır (bu doğru)
                     self.world.carve_river_along_path(self.river_path_points, self.editor.get_river_settings(), action)
                     self.undo_manager.register_action(action)
                     self.river_path_points.clear()
-                    self.update_river_path_vbo()
+                    # DEĞİŞİKLİK: İşlem bitince detaylı yolu da temizle
+                    self.draped_path_vertices.clear()
+                    self.update_river_path_vbo(self.draped_path_vertices)
 
         # --- 5. Adım: Sürekli Devam Eden Eylemler ---
         # Arayüz odağı almadıysa, tuş basılı tutulduğunda devam eden eylemleri gerçekleştir.
@@ -426,7 +479,7 @@ class App:
             
             glDepthMask(GL_TRUE); glEnable(GL_CULL_FACE)
 
-        if self.editor.get_selected_tool() == "river" and len(self.river_path_points) > 1:
+        if self.editor.get_selected_tool() == "river" and self.draped_path_vertices:
             glUseProgram(self.cursor_shader) # İmlecin shader'ını kullanabiliriz
             
             # Uniform'ları tekrar ayarla
@@ -437,9 +490,11 @@ class App:
 
             glLineWidth(3.0) # Çizgi kalınlığı
             glBindVertexArray(self.river_path_vao)
-            glDrawArrays(GL_LINE_STRIP, 0, len(self.river_path_points))
+            # DEĞİŞİKLİK: Detaylı yolun uzunluğunu kullan
+            glDrawArrays(GL_LINE_STRIP, 0, len(self.draped_path_vertices))
             glBindVertexArray(0)
             glLineWidth(1.0) # Kalınlığı sıfırla
+
 
 
         glUseProgram(0)

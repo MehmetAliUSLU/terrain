@@ -23,11 +23,12 @@ class Editor:
         self.invert_zoom = False
         
         self.ui_width = 250
-        self.ui_height = 320 # Yüksekliği biraz artıralım
+        self.ui_height = 370 # Yüksekliği biraz artıralım
         self.ui_pos_x = 10
         self.ui_pos_y = 10
 
     def draw_ui(self):
+        action_taken = None 
         imgui.set_next_window_position(self.ui_pos_x, self.ui_pos_y, imgui.ONCE)
         imgui.set_next_window_size(self.ui_width, self.ui_height, imgui.ONCE)
         
@@ -79,7 +80,7 @@ class Editor:
             _, self.river_smoothing = imgui.slider_float("Yumuşatma", self.river_smoothing, 0.1, 1.0)
             
             imgui.separator()
-            # Bu butonlara main.py'de işlevsellik kazandıracağız
+            # 2. Butona basıldığında değişkenin değeri ayarlanır (bu kısım zaten doğruydu)
             if imgui.button("Yolu Temizle"):
                 action_taken = "clear_river_path"
             imgui.same_line()
@@ -97,6 +98,8 @@ class Editor:
         _, self.invert_zoom = imgui.checkbox("Yakınlaştırmayı Çevir", self.invert_zoom)
         
         imgui.end()
+
+        return action_taken
 
     def get_selected_tool(self):
         if self.tool_mode == 0: return "raise"
