@@ -12,7 +12,9 @@ class Editor:
         
         # YENİ: Dere Yatağı aracı modu (7)
         self.tool_mode = 0  # ..., 6-Hafızalı Eğim, 7-Dere Yatağı
-        
+        self.brush_shape = 0  # YENİ: 0 -> Dairesel, 1 -> Kare
+        self.brush_softness = 0.5  # YENİ: 0.0 -> En Sert, 1.0 -> En Yumuşak
+
         # YENİ: Dere yatağı aracı için özel ayarlar
         self.river_width = 4.0 # Dere yatağının genişliği
         self.river_depth = 1.5 # Yatağın ne kadar derin olacağı
@@ -37,7 +39,10 @@ class Editor:
         imgui.text("Fırça Ayarları")
         _, self.brush_size = imgui.slider_int("Boyut", self.brush_size, 1, 20)
         _, self.brush_strength = imgui.slider_float("Güç", self.brush_strength, 0.01, 1.0)
-
+        _, self.brush_softness = imgui.slider_float("Yumuşaklık", self.brush_softness, 0.0, 1.0)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Fırçanın kenar sertliğini ayarlar.\n0.0: Sert Kenar, 1.0: Yumuşak Kenar")
+        
         imgui.separator()
         imgui.text("Araç")
         
@@ -56,6 +61,12 @@ class Editor:
         if imgui.radio_button("Hafızalı Eğim", self.tool_mode == 6): self.tool_mode = 6
         
         if imgui.radio_button("Dere Yatağı", self.tool_mode == 7): self.tool_mode = 7
+        
+        
+        imgui.text("Şekil")
+        if imgui.radio_button("Dairesel", self.brush_shape == 0): self.brush_shape = 0
+        imgui.same_line()
+        if imgui.radio_button("Kare", self.brush_shape == 1): self.brush_shape = 1
 
         # Eğer "Boya" aracı seçiliyse, doku seçeneklerini göster
         if self.tool_mode == 4:
@@ -111,7 +122,15 @@ class Editor:
         if self.tool_mode == 6: return "memory_slope"
         if self.tool_mode == 7: return "river"
         return "raise"
-    
+        
+    def get_brush_settings(self):
+        return {
+            "size": self.brush_size,
+            "strength": self.brush_strength,
+            "shape": self.brush_shape, # 0: Daire, 1: Kare
+            "softness": self.brush_softness
+        }
+        
     def get_river_settings(self):
         return {
             "width": self.river_width,

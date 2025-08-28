@@ -12,36 +12,72 @@ from history import EditAction
 
 @numba.jit(nopython=True, cache=True)
 def create_heightmap_mesh(heightmap):
-    vertices = []
-    dtype = np.float32
-    # Her bir vertex artık 8 değer içerecek: X, Y, Z, NormalX, NormalY, NormalZ, U, V
+    # --- 1. ADIM: Her bir verteks için doğru yönde normalleri biriktirmek ---
+    normals = np.zeros((CHUNK_WIDTH + 1, CHUNK_DEPTH + 1, 3), dtype=np.float32)
+
     for x in range(CHUNK_WIDTH):
         for z in range(CHUNK_DEPTH):
-            # Dört köşe noktasının pozisyonları
+            p1 = np.array([x,     heightmap[x, z],     z],     dtype=np.float32)
+            p2 = np.array([x + 1, heightmap[x + 1, z], z],     dtype=np.float32)
+            p3 = np.array([x,     heightmap[x, z + 1], z + 1], dtype=np.float32)
+            p4 = np.array([x + 1, heightmap[x + 1, z + 1], z + 1], dtype=np.float32)
+
+            # İlk üçgen (p1, p3, p2) - Saatın Tersi Yönünde (CCW)
+            # Bu sıralama, yukarı (+Y) yönünde bir normal vektörü üretir.
+            vec1 = p3 - p1
+            vec2 = p2 - p1
+            normal1 = np.cross(vec1, vec2)
+            
+            normals[x, z] += normal1
+            normals[x, z + 1] += normal1
+            normals[x + 1, z] += normal1
+
+            # İkinci üçgen (p3, p4, p2) - Saatın Tersi Yönünde (CCW)
+            vec3 = p4 - p3
+            vec4 = p2 - p3
+            normal2 = np.cross(vec3, vec4)
+
+            normals[x, z + 1] += normal2
+            normals[x + 1, z + 1] += normal2
+            normals[x + 1, z] += normal2
+
+    # --- 2. ADIM: Biriktirilen tüm normalleri normalize etmek ---
+    for i in range(normals.shape[0]):
+        for j in range(normals.shape[1]):
+            norm = normals[i, j]
+            mag = np.sqrt(norm[0]**2 + norm[1]**2 + norm[2]**2)
+            if mag > 0:
+                normals[i, j] = norm / mag
+
+    # --- 3. ADIM: Nihai verteks verisini doğru sarım sırasıyla oluşturmak ---
+    vertices = []
+    dtype = np.float32
+    for x in range(CHUNK_WIDTH):
+        for z in range(CHUNK_DEPTH):
             pos1 = np.array([x,     heightmap[x, z],     z],     dtype=dtype)
             pos2 = np.array([x + 1, heightmap[x + 1, z], z],     dtype=dtype)
             pos3 = np.array([x,     heightmap[x, z + 1], z + 1], dtype=dtype)
             pos4 = np.array([x + 1, heightmap[x + 1, z + 1], z + 1], dtype=dtype)
 
-            # Doku koordinatları (UV)
+            n1 = normals[x, z]
+            n2 = normals[x + 1, z]
+            n3 = normals[x, z + 1]
+            n4 = normals[x + 1, z + 1]
+
             uv1 = np.array([x, z], dtype=dtype)
             uv2 = np.array([x + 1, z], dtype=dtype)
             uv3 = np.array([x, z + 1], dtype=dtype)
             uv4 = np.array([x + 1, z + 1], dtype=dtype)
-
-            # İki üçgen için normaller
-            vec1 = pos3 - pos1; vec2 = pos2 - pos1; normal1 = np.cross(vec1, vec2)
-            vec3 = pos4 - pos3; vec4 = pos2 - pos3; normal2 = np.cross(vec3, vec4)
             
-            # 1. Üçgen
-            vertices.extend([pos1[0], pos1[1], pos1[2], normal1[0], normal1[1], normal1[2], uv1[0], uv1[1]])
-            vertices.extend([pos3[0], pos3[1], pos3[2], normal1[0], normal1[1], normal1[2], uv3[0], uv3[1]])
-            vertices.extend([pos2[0], pos2[1], pos2[2], normal1[0], normal1[1], normal1[2], uv2[0], uv2[1]])
+            # 1. Üçgen (pos1, pos3, pos2) - Sarım sırası, normal hesaplamasıyla EŞLEŞMELİ
+            vertices.extend([pos1[0], pos1[1], pos1[2], n1[0], n1[1], n1[2], uv1[0], uv1[1]])
+            vertices.extend([pos3[0], pos3[1], pos3[2], n3[0], n3[1], n3[2], uv3[0], uv3[1]])
+            vertices.extend([pos2[0], pos2[1], pos2[2], n2[0], n2[1], n2[2], uv2[0], uv2[1]])
             
-            # 2. Üçgen
-            vertices.extend([pos3[0], pos3[1], pos3[2], normal2[0], normal2[1], normal2[2], uv3[0], uv3[1]])
-            vertices.extend([pos4[0], pos4[1], pos4[2], normal2[0], normal2[1], normal2[2], uv4[0], uv4[1]])
-            vertices.extend([pos2[0], pos2[1], pos2[2], normal2[0], normal2[1], normal2[2], uv2[0], uv2[1]])
+            # 2. Üçgen (pos3, pos4, pos2) - Sarım sırası, normal hesaplamasıyla EŞLEŞMELİ
+            vertices.extend([pos3[0], pos3[1], pos3[2], n3[0], n3[1], n3[2], uv3[0], uv3[1]])
+            vertices.extend([pos4[0], pos4[1], pos4[2], n4[0], n4[1], n4[2], uv4[0], uv4[1]])
+            vertices.extend([pos2[0], pos2[1], pos2[2], n2[0], n2[1], n2[2], uv2[0], uv2[1]])
             
     return np.array(vertices, dtype=dtype)
 
@@ -296,15 +332,43 @@ class World:
         self.request_queue.put(chunk)
         
         
-    def modify_terrain(self, world_pos, brush_size, strength, tool_type, current_action, paint_index=0, target_height=None, target_normal=None, stroke_anchor_pos=None):
+    def modify_terrain(self, world_pos, brush_settings, strength, tool_type, current_action, paint_index=0, target_height=None, target_normal=None, stroke_anchor_pos=None):
+        brush_size = brush_settings["size"]
+        strength = brush_settings["strength"]
+        brush_shape = brush_settings["shape"]
+        softness = brush_settings["softness"]
+
         center_x, center_z = world_pos.x, world_pos.z
         radius = brush_size / 2.0
         affected_chunks = set()
         
         height_updates = []
+        
+        exponent = 0.25 + (1.0 - softness) * 3.75
 
         for x in range(int(np.floor(center_x - radius)), int(np.ceil(center_x + radius))):
             for z in range(int(np.floor(center_z - radius)), int(np.ceil(center_z + radius))):
+                
+                normalized_dist = 1.0
+
+                if brush_shape == 0: # Dairesel Fırça
+                    dist_sq = (x - center_x)**2 + (z - center_z)**2
+                    if dist_sq > radius**2: continue
+                    # Merkezden uzaklığı [0, 1] aralığında normalize et
+                    normalized_dist = np.sqrt(dist_sq) / radius
+
+                elif brush_shape == 1: # Kare Fırça
+                    dist_x = abs(x - center_x)
+                    dist_z = abs(z - center_z)
+                    if dist_x > radius or dist_z > radius: continue
+                    # Merkezden en uzak eksendeki mesafeyi normalize et
+                    normalized_dist = max(dist_x, dist_z) / radius
+
+                base = max(0.0, 1.0 - normalized_dist)
+                falloff = pow(base, exponent)
+                if falloff <= 0: continue
+                
+                
                 dist_sq = (x - center_x)**2 + (z - center_z)**2
                 if dist_sq > radius**2: continue
                 
@@ -315,7 +379,6 @@ class World:
                 local_z = int(round(z - chunk.position.z * CHUNK_DEPTH))
 
                 if 0 <= local_x < CHUNK_WIDTH + 1 and 0 <= local_z < CHUNK_DEPTH + 1:
-                    falloff = 1.0 - (dist_sq / radius**2)
                     
                     # Değişiklikten önceki değerleri al
                     old_h = chunk.heightmap[local_x, local_z]

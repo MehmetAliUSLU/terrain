@@ -36,6 +36,13 @@ class App:
         pygame.init()
         self.screen_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
         self.window = pygame.display.set_mode(self.screen_size, DOUBLEBUF | OPENGL | RESIZABLE)
+        
+        print("OpenGL Version:", glGetString(GL_VERSION).decode())
+        print("GLSL Version:", glGetString(GL_SHADING_LANGUAGE_VERSION).decode())
+        print("Vendor:", glGetString(GL_VENDOR).decode())
+        print("Renderer:", glGetString(GL_RENDERER).decode())
+        
+        
         imgui.create_context()
         self.renderer = PygameRenderer()
         self.io = imgui.get_io()
@@ -187,7 +194,7 @@ class App:
         
         self.dynamic_preview_ebo = glGenBuffers(1)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.dynamic_preview_ebo)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, 0, None, GL_DYNAMIC_DRAW)
         
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
         glEnableVertexAttribArray(0)
@@ -380,7 +387,7 @@ class App:
                     current_normal_to_use = self.slope_memory_normal
 
                 self.world.modify_terrain(
-                    self.cursor_pos, self.editor.brush_size, self.editor.brush_strength, 
+                    self.cursor_pos, self.editor.get_brush_settings(), self.editor.brush_strength, 
                     selected_tool, current_action=self.current_action, 
                     paint_index=self.editor.get_paint_texture_index(), target_height=self.flatten_target_height,
                     target_normal=current_normal_to_use, stroke_anchor_pos=self.stroke_start_pos
@@ -446,38 +453,66 @@ class App:
             glUniformMatrix4fv(model_loc, 1, GL_FALSE, pyrr.matrix44.create_identity())
             glUniform4f(color_loc, 1.0, 1.0, 0.0, 0.5)
 
-            segments = 32
-            radius = self.editor.brush_size / 2.0
-            vertices = []
+            brush_settings = self.editor.get_brush_settings()
+            brush_shape = brush_settings["shape"]
+            radius = brush_settings["size"] / 2.0
             center_x, center_z = self.cursor_pos.x, self.cursor_pos.z
-            center_y = self.world.get_height_at_world_pos(center_x, center_z) + 0.05
-            vertices.extend([center_x, center_y, center_z])
             
-            for i in range(segments):
-                angle = i * (2 * np.pi / segments)
-                world_x = center_x + np.cos(angle) * radius
-                world_z = center_z + np.sin(angle) * radius
-                world_y = self.world.get_height_at_world_pos(world_x, world_z) + 0.05
-                vertices.extend([world_x, world_y, world_z])
-            
-            vertices = np.array(vertices, dtype=np.float32)
+            vertices = []
+            indices = []
+
+            if brush_shape == 0: # Dairesel Önizleme
+                segments = 32
+                # Merkez verteksi ekle
+                center_y = self.world.get_height_at_world_pos(center_x, center_z) + 0.05
+                vertices.extend([center_x, center_y, center_z])
+                # Çember üzerindeki verteksleri ekle
+                for i in range(segments):
+                    angle = i * (2 * np.pi / segments)
+                    world_x = center_x + np.cos(angle) * radius
+                    world_z = center_z + np.sin(angle) * radius
+                    world_y = self.world.get_height_at_world_pos(world_x, world_z) + 0.05
+                    vertices.extend([world_x, world_y, world_z])
+                # Üçgen fanı için indeksleri oluştur
+                for i in range(segments):
+                    indices.extend([0, i + 1, ((i + 1) % segments) + 1])
+
+            elif brush_shape == 1: # Kare Önizleme
+                grid_res = 10 # Önizlemenin ne kadar detaylı olacağı
+                for i in range(grid_res + 1):
+                    for j in range(grid_res + 1):
+                        # [-0.5, 0.5] aralığından [center-radius, center+radius] aralığına haritala
+                        world_x = center_x + (j / grid_res - 0.5) * brush_settings["size"]
+                        world_z = center_z + (i / grid_res - 0.5) * brush_settings["size"]
+                        world_y = self.world.get_height_at_world_pos(world_x, world_z) + 0.05
+                        vertices.append([world_x, world_y, world_z])
+                # Grid için indeksleri oluştur
+                for i in range(grid_res):
+                    for j in range(grid_res):
+                        idx0 = i * (grid_res + 1) + j
+                        idx1 = idx0 + 1
+                        idx2 = (i + 1) * (grid_res + 1) + j
+                        idx3 = idx2 + 1
+                        indices.extend([idx0, idx2, idx1])
+                        indices.extend([idx1, idx2, idx3])
+
+            vertices = np.array(vertices, dtype=np.float32).flatten()
+            indices = np.array(indices, dtype=np.uint32)
             
             glBindVertexArray(self.dynamic_preview_vao)
+            
             glBindBuffer(GL_ARRAY_BUFFER, self.dynamic_preview_vbo)
             glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
-            glDrawElements(GL_TRIANGLES, self.dynamic_preview_index_count, GL_UNSIGNED_INT, None)
-            glBindVertexArray(0)
-
-            # 2. Merkez İmleci (Küp) Çiz
-            cursor_model_matrix = (pyrr.matrix44.create_from_scale([0.2, 0.2, 0.2]) @ pyrr.matrix44.create_from_translation(self.cursor_pos))
-            glUniformMatrix4fv(model_loc, 1, GL_FALSE, cursor_model_matrix)
-            glUniform4f(color_loc, 1.0, 0.0, 0.0, 0.8)
-
-            glBindVertexArray(self.cursor_vao)
-            glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, None)
-            glBindVertexArray(0)
             
-            glDepthMask(GL_TRUE); glEnable(GL_CULL_FACE)
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.dynamic_preview_ebo)
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_DYNAMIC_DRAW)
+            
+            glDrawElements(GL_TRIANGLES, len(indices), GL_UNSIGNED_INT, None)
+            
+            glBindVertexArray(0)
+            glDepthMask(GL_TRUE)      # Derinlik yazmayı tekrar AÇ
+            glEnable(GL_CULL_FACE)    # Arka yüz kırpmayı tekrar AÇ
+            glDisable(GL_BLEND)       # Saydamlığı KAPAT
 
         if self.editor.get_selected_tool() == "river" and self.draped_path_vertices:
             glUseProgram(self.cursor_shader) # İmlecin shader'ını kullanabiliriz
