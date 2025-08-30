@@ -25,6 +25,11 @@ def ensure_chunk_by_coord(world, cx: int, cz: int) -> Chunk:
             wz = cz * CHUNK_DEPTH + z
             chunk.heightmap[x, z] = procedural_height(wx, wz)
     bake_splatmap_for_chunk(chunk)
+    # Persisted override (if any)
+    try:
+        world.try_load_chunk_from_disk(cx, cz, chunk)
+    except Exception:
+        pass
     world.chunks[key] = chunk
     chunk.is_meshing = True
     world.request_queue.put(chunk)
@@ -63,7 +68,8 @@ def update_streaming(world, center_world_pos) -> None:
     for key in to_remove:
         chunk = world.chunks.pop(key)
         try:
+            # Save edits before freeing GPU memory
+            world.save_chunk_to_disk(chunk)
             chunk.destroy()
         except Exception:
             pass
-

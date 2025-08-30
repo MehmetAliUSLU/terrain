@@ -6,6 +6,7 @@ import numba
 import pyrr
 import ctypes
 import noise
+import os
 
 from settings import (
     CHUNK_WIDTH,
@@ -231,6 +232,9 @@ class World:
     def __init__(self, request_queue):
         self.chunks = {}
         self.request_queue = request_queue
+        # Persist edits across unload/load
+        self.save_dir = os.path.join("saves", "chunks")
+        os.makedirs(self.save_dir, exist_ok=True)
         self.spawn_initial_chunks()
         
         
@@ -340,7 +344,7 @@ class World:
             total_length += np.linalg.norm(path_points[i+1] - path_points[i])
         
         interpolated_points = []
-        num_steps = int(total_length) # Her bir dünya biriminde bir nokta
+        num_steps = max(1, int(total_length)) # Her bir dünya biriminde bir nokta
         for i in range(num_steps + 1):
             progress = i / num_steps
             
@@ -376,37 +380,53 @@ class World:
                     if key not in points_to_modify or target_height < points_to_modify[key]:
                         points_to_modify[key] = target_height
 
-        # 3. Değişiklikleri ve yumuşatmayı uygula
-        chunk = self.chunks.get((0,0,0)) # Tek chunk varsayımı
-        if not chunk: return
-
+        # 3. De�i�iklikleri ve yumu�atmay� uygula (�ok-chunk)
+        affected_chunks = set()
         for (x, z), target_h in points_to_modify.items():
+            cx = int(np.floor(x / CHUNK_WIDTH))
+            cz = int(np.floor(z / CHUNK_DEPTH))
+            chunk = self.chunks.get((cx, 0, cz))
+            if chunk is None:
+                # Gerekirse chunk'� olu�tur (prosed�rel)
+                pos = pyrr.Vector3([cx, 0, cz], dtype=np.int32)
+                chunk = Chunk(pos)
+                for xx in range(CHUNK_WIDTH + 1):
+                    for zz in range(CHUNK_DEPTH + 1):
+                        wx = cx * CHUNK_WIDTH + xx
+                        wz = cz * CHUNK_DEPTH + zz
+                        chunk.heightmap[xx, zz] = procedural_height(wx, wz)
+                bake_splatmap_for_chunk(chunk)
+                self.chunks[(cx, 0, cz)] = chunk
+                chunk.is_meshing = True
+                self.request_queue.put(chunk)
+
             local_x = int(round(x - chunk.position.x * CHUNK_WIDTH))
             local_z = int(round(z - chunk.position.z * CHUNK_DEPTH))
 
             if 0 <= local_x < CHUNK_WIDTH + 1 and 0 <= local_z < CHUNK_DEPTH + 1:
-                # Geri alma için eski verileri kaydet
                 old_h = chunk.heightmap[local_x, local_z]
                 old_s = chunk.splatmap[local_z, local_x].copy()
 
-                # Yeni yüksekliği uygula (eğer daha alçaksa)
                 new_h = min(old_h, target_h)
                 chunk.heightmap[local_x, local_z] = new_h
 
-                # Dere yatağının içini "toprak" dokusuyla boya
-                new_s = np.array([0.0, 1.0, 0.0], dtype=np.float32) # Saf toprak
-                chunk.splatmap[local_z, local_x] = old_s + (new_s - old_s) * 0.5 # Biraz karıştır
-                
-                action.record_change(chunk, local_x, local_z, old_h, new_h, old_s, chunk.splatmap[local_z, local_x].copy())
-        
-        # Kenarları yumuşat (bu ayrı bir "smooth" işlemi gibi)
-        # (Bu kısım performansı etkileyebilir ve daha da iyileştirilebilir)
-        # Şimdilik bu adımı atlayarak temel işlevselliği sağlıyoruz.
-        # Yumuşatma, değiştirilen noktaların etrafındaki komşulara bir smooth fırçası uygulamakla yapılabilir.
+                target_s = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                mixed_s = old_s + (target_s - old_s) * 0.5
+                chunk.splatmap[local_z, local_x] = mixed_s
+                chunk.splatmap_is_dirty = True
 
-        chunk.is_dirty = True
-        chunk.is_meshing = True
-        self.request_queue.put(chunk)
+                if local_x in (0, CHUNK_WIDTH) or local_z in (0, CHUNK_DEPTH):
+                    self._mirror_border_update(chunk, local_x, local_z, new_h, mixed_s, action)
+
+                action.record_change(chunk, local_x, local_z, old_h, new_h, old_s, mixed_s.copy())
+                affected_chunks.add(chunk)
+
+        # Etkilenen chunklar� mesh i�in kuyru�a al
+        for chunk in affected_chunks:
+            chunk.is_dirty = True
+            if not chunk.is_meshing:
+                chunk.is_meshing = True
+                self.request_queue.put(chunk)
         
         
     def modify_terrain(self, world_pos, brush_settings, strength, tool_type, current_action, paint_index=0, target_height=None, target_normal=None, stroke_anchor_pos=None):
@@ -591,3 +611,32 @@ class World:
                 return current_pos
             current_pos += ray_direction * step_size
         return None
+
+    # --- Persistence helpers ---
+    def _chunk_save_path(self, cx, cz):
+        return os.path.join(self.save_dir, f"{cx}_{cz}.npz")
+
+    def save_chunk_to_disk(self, chunk):
+        try:
+            cx = int(chunk.position.x); cz = int(chunk.position.z)
+            path = self._chunk_save_path(cx, cz)
+            np.savez_compressed(path, heightmap=chunk.heightmap, splatmap=chunk.splatmap)
+        except Exception as e:
+            print(f"Chunk kaydetme hatasi: {e}")
+
+    def try_load_chunk_from_disk(self, cx, cz, chunk):
+        try:
+            path = self._chunk_save_path(cx, cz)
+            if os.path.exists(path):
+                with np.load(path) as data:
+                    if 'heightmap' in data: chunk.heightmap[:, :] = data['heightmap']
+                    if 'splatmap' in data: chunk.splatmap[:, :, :] = data['splatmap']
+                chunk.splatmap_is_dirty = True
+                return True
+        except Exception as e:
+            print(f"Chunk yukleme hatasi: {e}")
+        return False
+
+
+
+

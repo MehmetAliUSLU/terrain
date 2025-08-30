@@ -24,6 +24,11 @@ class Editor:
         self.invert_pan_orbit_y = False
         self.invert_zoom = False
         
+
+        # Kamera h�z ayarlar�
+        self.orbit_sensitivity = 0.4
+        self.pan_speed_factor = 1.0
+        self.zoom_sensitivity = 2.0
         self.ui_width = 250
         self.ui_height = 370 # Yüksekliği biraz artıralım
         self.ui_pos_x = 10
@@ -107,6 +112,11 @@ class Editor:
         _, self.invert_pan_orbit_x = imgui.checkbox("Yatay Ekseni Çevir", self.invert_pan_orbit_x)
         _, self.invert_pan_orbit_y = imgui.checkbox("Dikey Ekseni Çevir", self.invert_pan_orbit_y)
         _, self.invert_zoom = imgui.checkbox("Yakınlaştırmayı Çevir", self.invert_zoom)
+        imgui.separator()
+        imgui.text("Kamera Hizlari")
+        _, self.orbit_sensitivity = imgui.slider_float("Orbit Hass.", self.orbit_sensitivity, 0.05, 1.5)
+        _, self.pan_speed_factor = imgui.slider_float("Pan Hizi", self.pan_speed_factor, 0.2, 3.0)
+        _, self.zoom_sensitivity = imgui.slider_float("Zoom Hizi", self.zoom_sensitivity, 0.2, 5.0)
         
         imgui.end()
 
@@ -147,3 +157,11 @@ class Editor:
             "y": self.invert_pan_orbit_y,
             "zoom": self.invert_zoom
         }
+
+    def get_control_speeds(self):
+        return {
+            "orbit": self.orbit_sensitivity,
+            "pan": self.pan_speed_factor,
+            "zoom": self.zoom_sensitivity,
+        }
+
