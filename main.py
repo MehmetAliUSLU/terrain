@@ -18,6 +18,7 @@ from imgui.integrations.pygame import PygameRenderer
 from settings import SCREEN_WIDTH, SCREEN_HEIGHT, VERTEX_SHADER, FRAGMENT_SHADER, CURSOR_VERTEX_SHADER, CURSOR_FRAGMENT_SHADER
 from camera import Camera
 from world import World
+import streaming
 from editor import Editor
 from history import UndoManager, EditAction
 
@@ -80,6 +81,8 @@ class App:
         self.world = World(self.meshing_request_queue)
         self.worker_thread = threading.Thread(target=mesh_worker, args=(self.meshing_request_queue, self.meshing_result_queue), daemon=True)
         self.worker_thread.start()
+        # Spawn initial chunk ring around camera target
+        streaming.update_streaming(self.world, self.camera.target)
         self.editor = Editor()
         self.clock = pygame.time.Clock()
         
@@ -235,6 +238,8 @@ class App:
         while True:
             dt = self.clock.tick(60) / 1000.0
             if self.handle_events_and_inputs(dt) is False: break
+            # Stream chunks around camera target for infinite world
+            streaming.update_streaming(self.world, self.camera.target)
             self.process_meshing_results()
             self.render_scene()
         self.quit()
@@ -313,8 +318,9 @@ class App:
                                 self.slope_memory_normal = self.world.get_normal_at_world_pos(cursor_pos.x, cursor_pos.z)
                                 print(f"Eğim Kopyalandı! Normal: {self.slope_memory_normal}")
                             else:
-                                chunk = self.world.get_chunk_at_world_pos(cursor_pos.x, cursor_pos.z)
-                                if chunk: self.current_action = EditAction(chunk)
+                                # Ensure the chunk exists where we start editing
+                                chunk = streaming.ensure_chunk_at_world_pos(self.world, cursor_pos.x, cursor_pos.z)
+                                if chunk: self.current_action = EditAction()
                                 self.stroke_start_pos = cursor_pos
                                 if selected_tool == "flatten":
                                     self.flatten_target_height = cursor_pos.y - 0.1
@@ -358,7 +364,7 @@ class App:
             if len(self.river_path_points) > 1:
                 chunk = self.world.chunks.get((0,0,0)) # Tek chunk varsayımı
                 if chunk:
-                    action = EditAction(chunk)
+                    action = EditAction()
                     # Dere oyma işlemi ana noktaları kullanır (bu doğru)
                     self.world.carve_river_along_path(self.river_path_points, self.editor.get_river_settings(), action)
                     self.undo_manager.register_action(action)
@@ -559,3 +565,4 @@ if __name__ == "__main__":
     app = App()
     app.setup_river_path_renderer()
     app.run()
+

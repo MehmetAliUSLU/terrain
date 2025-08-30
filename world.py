@@ -7,7 +7,17 @@ import pyrr
 import ctypes
 import noise
 
-from settings import CHUNK_WIDTH, CHUNK_DEPTH
+from settings import (
+    CHUNK_WIDTH,
+    CHUNK_DEPTH,
+    RENDER_DISTANCE,
+    UNLOAD_DISTANCE,
+    TERRAIN_SCALE,
+    NOISE_OCTAVES,
+    NOISE_PERSISTENCE,
+    NOISE_LACUNARITY,
+    HEIGHT_SCALE,
+)
 from history import EditAction
 
 @numba.jit(nopython=True, cache=True)
@@ -81,6 +91,49 @@ def create_heightmap_mesh(heightmap):
             
     return np.array(vertices, dtype=dtype)
 
+# --- Procedural terrain helpers ---
+def procedural_height(world_x, world_z):
+    n = noise.pnoise2(
+        world_x / TERRAIN_SCALE,
+        world_z / TERRAIN_SCALE,
+        octaves=NOISE_OCTAVES,
+        persistence=NOISE_PERSISTENCE,
+        lacunarity=NOISE_LACUNARITY,
+        base=0,
+    )
+    return (n + 1.0) * 0.5 * HEIGHT_SCALE
+
+def bake_splatmap_for_chunk(chunk):
+    for x in range(CHUNK_WIDTH + 1):
+        for z in range(CHUNK_DEPTH + 1):
+            h_dx = chunk.heightmap[min(x + 1, CHUNK_WIDTH), z] - chunk.heightmap[max(x - 1, 0), z]
+            h_dz = chunk.heightmap[x, min(z + 1, CHUNK_DEPTH)] - chunk.heightmap[x, max(z - 1, 0)]
+            normal_approx = np.array([-h_dx, 2.0, -h_dz], dtype=np.float32)
+            norm = np.linalg.norm(normal_approx)
+            if norm > 0:
+                normal_approx /= norm
+            slope = 1.0 - normal_approx[1]
+
+            height = chunk.heightmap[x, z]
+
+            slope_grass = 0.35
+            slope_rock = 0.7
+            height_dirt = 2.5
+
+            dirt_blend_slope = np.clip((slope - (slope_grass - 0.1)) / 0.2, 0, 1)
+            dirt_blend_height = np.clip((height - (height_dirt - 1.0)) / 2.0, 0, 1)
+            dirt_blend = max(dirt_blend_slope, dirt_blend_height)
+
+            grass_weight = 1.0 - dirt_blend
+            dirt_weight = dirt_blend
+            rock_blend = np.clip((slope - (slope_rock - 0.2)) / 0.4, 0, 1)
+
+            final_grass = grass_weight * (1.0 - rock_blend)
+            final_dirt = dirt_weight * (1.0 - rock_blend)
+            final_rock = rock_blend
+
+            chunk.splatmap[z, x] = [final_grass, final_dirt, final_rock]
+
 class Chunk:
     def __init__(self, position):
         self.position = position
@@ -119,6 +172,26 @@ class Chunk:
 
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
+
+    def destroy(self):
+        if self.vbo is not None:
+            try:
+                glDeleteBuffers(1, [self.vbo])
+            except Exception:
+                pass
+            self.vbo = None
+        if self.vao is not None:
+            try:
+                glDeleteVertexArrays(1, [self.vao])
+            except Exception:
+                pass
+            self.vao = None
+        if self.splatmap_texture is not None:
+            try:
+                glDeleteTextures(1, [self.splatmap_texture])
+            except Exception:
+                pass
+            self.splatmap_texture = None
 
     def upload_splatmap_to_gpu(self):
         if self.splatmap_texture is None:
@@ -235,15 +308,19 @@ class World:
         try:
             chunk_pos_x = int(np.floor(world_x / CHUNK_WIDTH)); chunk_pos_z = int(np.floor(world_z / CHUNK_DEPTH))
             chunk = self.chunks.get((chunk_pos_x, 0, chunk_pos_z))
-            if chunk is None: return 0.0
+            if chunk is None:
+                return procedural_height(world_x, world_z)
             local_x = world_x - chunk_pos_x * CHUNK_WIDTH; local_z = world_z - chunk_pos_z * CHUNK_DEPTH
             grid_x = int(np.floor(local_x)); grid_z = int(np.floor(local_z))
             x_frac = local_x - grid_x; z_frac = local_z - grid_z
             h00 = chunk.heightmap[grid_x, grid_z]; h10 = chunk.heightmap[grid_x + 1, grid_z]
             h01 = chunk.heightmap[grid_x, grid_z + 1]; h11 = chunk.heightmap[grid_x + 1, grid_z + 1]
-            if x_frac + z_frac < 1: return h00 + (h10 - h00) * x_frac + (h01 - h00) * z_frac
-            else: return h11 + (h01 - h11) * (1 - x_frac) + (h10 - h11) * (1 - z_frac)
-        except (KeyError, IndexError): return 0.0
+            if x_frac + z_frac < 1:
+                return h00 + (h10 - h00) * x_frac + (h01 - h00) * z_frac
+            else:
+                return h11 + (h01 - h11) * (1 - x_frac) + (h10 - h11) * (1 - z_frac)
+        except (KeyError, IndexError):
+            return procedural_height(world_x, world_z)
 
 
     def carve_river_along_path(self, path_points, settings, action):
@@ -320,7 +397,7 @@ class World:
                 new_s = np.array([0.0, 1.0, 0.0], dtype=np.float32) # Saf toprak
                 chunk.splatmap[local_z, local_x] = old_s + (new_s - old_s) * 0.5 # Biraz karıştır
                 
-                action.record_change(local_x, local_z, old_h, new_h, old_s, chunk.splatmap[local_z, local_x].copy())
+                action.record_change(chunk, local_x, local_z, old_h, new_h, old_s, chunk.splatmap[local_z, local_x].copy())
         
         # Kenarları yumuşat (bu ayrı bir "smooth" işlemi gibi)
         # (Bu kısım performansı etkileyebilir ve daha da iyileştirilebilir)
@@ -373,7 +450,7 @@ class World:
                 if dist_sq > radius**2: continue
                 
                 chunk = self.get_chunk_at_world_pos(x, z)
-                if not chunk or chunk != current_action.chunk: continue
+                if not chunk: continue
 
                 local_x = int(round(x - chunk.position.x * CHUNK_WIDTH))
                 local_z = int(round(z - chunk.position.z * CHUNK_DEPTH))
@@ -392,19 +469,28 @@ class World:
                         new_s = new_weights / np.sum(new_weights)
                         chunk.splatmap[local_z, local_x] = new_s
                         chunk.splatmap_is_dirty = True
+                        # Mirror paint across borders
+                        if local_x in (0, CHUNK_WIDTH) or local_z in (0, CHUNK_DEPTH):
+                            self._mirror_border_update(chunk, local_x, local_z, None, new_s, current_action)
                     
                     elif tool_type == "raise":
                         new_h = old_h + strength * falloff
                         chunk.heightmap[local_x, local_z] = new_h
+                        if local_x in (0, CHUNK_WIDTH) or local_z in (0, CHUNK_DEPTH):
+                            self._mirror_border_update(chunk, local_x, local_z, new_h, None, current_action)
                     
                     elif tool_type == "lower":
                         new_h = old_h - strength * falloff
                         chunk.heightmap[local_x, local_z] = new_h
+                        if local_x in (0, CHUNK_WIDTH) or local_z in (0, CHUNK_DEPTH):
+                            self._mirror_border_update(chunk, local_x, local_z, new_h, None, current_action)
 
                     elif tool_type == "flatten":
                         if target_height is None: continue
                         new_h = old_h + (target_height - old_h) * falloff * strength
                         chunk.heightmap[local_x, local_z] = new_h
+                        if local_x in (0, CHUNK_WIDTH) or local_z in (0, CHUNK_DEPTH):
+                            self._mirror_border_update(chunk, local_x, local_z, new_h, None, current_action)
                     
                     elif tool_type == "smooth":
                         total_height = 0; neighbor_count = 0
@@ -426,10 +512,12 @@ class World:
                             
                             new_h = old_h + (target_y - old_h) * strength * falloff
                             chunk.heightmap[local_x, local_z] = new_h
+                            if local_x in (0, CHUNK_WIDTH) or local_z in (0, CHUNK_DEPTH):
+                                self._mirror_border_update(chunk, local_x, local_z, new_h, None, current_action)
                             
                             
                     if tool_type != "smooth":
-                        current_action.record_change(local_x, local_z, old_h, new_h, old_s, new_s)
+                        current_action.record_change(chunk, local_x, local_z, old_h, new_h, old_s, new_s)
                     
                     affected_chunks.add(chunk)
 
@@ -437,7 +525,9 @@ class World:
             for chunk, lx, lz, old_h_smooth, new_h_smooth in height_updates:
                 chunk.heightmap[lx, lz] = new_h_smooth
                 old_s_smooth = chunk.splatmap[lz, lx].copy()
-                current_action.record_change(lx, lz, old_h_smooth, new_h_smooth, old_s_smooth, old_s_smooth)
+                current_action.record_change(chunk, lx, lz, old_h_smooth, new_h_smooth, old_s_smooth, old_s_smooth)
+                if lx in (0, CHUNK_WIDTH) or lz in (0, CHUNK_DEPTH):
+                    self._mirror_border_update(chunk, lx, lz, new_h_smooth, None, current_action)
 
         for chunk in affected_chunks:
             if tool_type != "paint" and not chunk.is_meshing:
@@ -447,6 +537,48 @@ class World:
         for chunk in self.chunks.values():
             chunk.draw(shader)
             
+    def _mirror_border_update(self, chunk, local_x, local_z, new_h, new_s, action):
+        """Mirror border vertex changes to neighbor chunks to avoid seams."""
+        cx = int(chunk.position.x); cz = int(chunk.position.z)
+        neighbors = []
+        # Edges
+        if local_x == 0:
+            neighbors.append(((cx - 1, 0, cz), CHUNK_WIDTH, local_z))
+        if local_x == CHUNK_WIDTH:
+            neighbors.append(((cx + 1, 0, cz), 0, local_z))
+        if local_z == 0:
+            neighbors.append(((cx, 0, cz - 1), local_x, CHUNK_DEPTH))
+        if local_z == CHUNK_DEPTH:
+            neighbors.append(((cx, 0, cz + 1), local_x, 0))
+        # Corners
+        if local_x == 0 and local_z == 0:
+            neighbors.append(((cx - 1, 0, cz - 1), CHUNK_WIDTH, CHUNK_DEPTH))
+        if local_x == CHUNK_WIDTH and local_z == 0:
+            neighbors.append(((cx + 1, 0, cz - 1), 0, CHUNK_DEPTH))
+        if local_x == 0 and local_z == CHUNK_DEPTH:
+            neighbors.append(((cx - 1, 0, cz + 1), CHUNK_WIDTH, 0))
+        if local_x == CHUNK_WIDTH and local_z == CHUNK_DEPTH:
+            neighbors.append(((cx + 1, 0, cz + 1), 0, 0))
+
+        for key, lx2, lz2 in neighbors:
+            nb = self.chunks.get(key)
+            if nb is None:
+                continue
+            old_h2 = nb.heightmap[lx2, lz2]
+            old_s2 = nb.splatmap[lz2, lx2].copy()
+            if new_h is not None:
+                nb.heightmap[lx2, lz2] = new_h
+            if new_s is not None:
+                nb.splatmap[lz2, lx2] = new_s
+                nb.splatmap_is_dirty = True
+            if action is not None:
+                nh2 = nb.heightmap[lx2, lz2]
+                ns2 = nb.splatmap[lz2, lx2].copy()
+                action.record_change(nb, lx2, lz2, old_h2, nh2, old_s2, ns2)
+            nb.is_dirty = True
+            if not nb.is_meshing:
+                nb.is_meshing = True
+                self.request_queue.put(nb)
     def raycast_terrain(self, ray_origin, ray_direction, max_dist=200):
         current_pos = ray_origin.copy()
         # <<< DEĞİŞİKLİK: Adım boyutunu küçülterek hassasiyeti artır >>>
@@ -459,4 +591,3 @@ class World:
                 return current_pos
             current_pos += ray_direction * step_size
         return None
-
