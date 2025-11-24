@@ -93,6 +93,3 @@ python main.py
 - `settings.py`: Configuration constants and shader code.
 - `textures/`: Directory containing texture assets.
 
-## License
-
-[MIT License](LICENSE)
