@@ -100,6 +100,13 @@ class App:
         self.dynamic_preview_index_count = 0
         self.setup_dynamic_preview_objects()
 
+        # Avoid camera jump on click: start orbit/pan only after tiny drag
+        self.drag_threshold_pixels = 3
+        self._orbit_drag_accum = 0.0
+        self._pan_drag_accum = 0.0
+        self._orbit_active = False
+        self._pan_active = False
+
 
     def generate_draped_path_vertices(self):
         """
@@ -312,26 +319,31 @@ class App:
                     if event.button == 2:  # Orta fare tuşu
                         if self.io.key_ctrl:
                             self.camera_panning = True
+                            self._pan_drag_accum = 0.0
+                            self._pan_active = False
                         else:
                             self.camera_orbiting = True
+                            self._orbit_drag_accum = 0.0
+                            self._orbit_active = False
                         pygame.mouse.get_rel()  # Göreceli hareketi sıfırla
                         pygame.event.set_grab(True)
                         pygame.mouse.set_visible(False)
                         pygame.mouse.get_rel()  # Greceli hareketi sıfırla
                         # Orbit/pan başlatıldığında pivotu imlecin altındaki araziye sabitle (yalnızca ORBIT)
                         if not self.io.key_ctrl:
-                            projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
-                            ray_params = self.camera.get_ray_from_mouse(pygame.mouse.get_pos(), self.screen_size[0], self.screen_size[1], projection_matrix)
-                            pivot_pos = self.world.raycast_terrain(*ray_params)
-                            if pivot_pos is not None:
-                                # Sadece hareket baflad1nda uygulamak 1in beklet
-                                self.pending_orbit_pivot = pivot_pos
+                                if self.editor.get_camera_options().get("orbit_to_cursor", False):
+                                    projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
+                                    ray_params = self.camera.get_ray_from_mouse(pygame.mouse.get_pos(), self.screen_size[0], self.screen_size[1], projection_matrix)
+                                    pivot_pos = self.world.raycast_terrain(*ray_params)
+                                    if pivot_pos is not None:
+                                        # Sadece hareket başladıktan sonra uygulamak için beklet
+                                        self.pending_orbit_pivot = pivot_pos
                     ray_params = self.camera.get_ray_from_mouse(pygame.mouse.get_pos(), self.screen_size[0], self.screen_size[1], projection_matrix)
                     cursor_pos = self.world.raycast_terrain(*ray_params)
                     
                     if cursor_pos is not None:
                         selected_tool = self.editor.get_selected_tool()
-                        
+                        ""
                         # Sol Tık Olayları
                         if event.button == 1:
                             if selected_tool == "river":
@@ -362,6 +374,8 @@ class App:
                         self.camera_orbiting = False
                         self.camera_panning = False
                         self.pending_orbit_pivot = None
+                        self._orbit_active = False
+                        self._pan_active = False
                         pygame.event.set_grab(False)
                         pygame.mouse.set_visible(True)
                     if event.button == 1:
@@ -466,10 +480,24 @@ class App:
                 mouse_rel = pygame.mouse.get_rel()
                 inversion_settings = self.editor.get_inversion_settings()
                 if self.camera_orbiting:
-                    if self.pending_orbit_pivot is not None and (mouse_rel[0] != 0 or mouse_rel[1] != 0):
-                        self.camera.retarget_preserve_position(self.pending_orbit_pivot)
-                        self.pending_orbit_pivot = None
-                    self.camera.process_orbit(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
+                    # Start orbiting only after a small drag to prevent jump
+                    self._orbit_drag_accum += abs(mouse_rel[0]) + abs(mouse_rel[1])
+                    if not self._orbit_active:
+                        if self._orbit_drag_accum > self.drag_threshold_pixels:
+                            if self.pending_orbit_pivot is not None:
+                                self.camera.retarget_preserve_position(self.pending_orbit_pivot)
+                                self.pending_orbit_pivot = None
+                            self._orbit_active = True
+                    if self._orbit_active:
+                        self.camera.process_orbit(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
+                if self.camera_panning:
+                    # Start panning only after a small drag
+                    self._pan_drag_accum += abs(mouse_rel[0]) + abs(mouse_rel[1])
+                    if not self._pan_active:
+                        if self._pan_drag_accum > self.drag_threshold_pixels:
+                            self._pan_active = True
+                    if self._pan_active:
+                        self.camera.process_pan(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
             
         return True
 
