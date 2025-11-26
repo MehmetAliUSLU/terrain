@@ -15,9 +15,10 @@ from PIL import Image
 import imgui
 from imgui.integrations.pygame import PygameRenderer
 
-from settings import SCREEN_WIDTH, SCREEN_HEIGHT, VERTEX_SHADER, FRAGMENT_SHADER, CURSOR_VERTEX_SHADER, CURSOR_FRAGMENT_SHADER
+from settings import SCREEN_WIDTH, SCREEN_HEIGHT, VERTEX_SHADER, FRAGMENT_SHADER, CURSOR_VERTEX_SHADER, CURSOR_FRAGMENT_SHADER, CHUNK_WIDTH, CHUNK_DEPTH
 from camera import Camera
 from world import World
+import streaming
 from editor import Editor
 from history import UndoManager, EditAction
 
@@ -80,12 +81,15 @@ class App:
         self.world = World(self.meshing_request_queue)
         self.worker_thread = threading.Thread(target=mesh_worker, args=(self.meshing_request_queue, self.meshing_result_queue), daemon=True)
         self.worker_thread.start()
+        # Spawn initial chunk ring around camera target
+        streaming.update_streaming(self.world, self.camera.target)
         self.editor = Editor()
         self.clock = pygame.time.Clock()
         
         self.flatten_target_height = None
         self.camera_orbiting = False
         self.camera_panning = False
+        self.pending_orbit_pivot = None
         
         self.cursor_pos = None
         self.setup_cursor()
@@ -95,6 +99,13 @@ class App:
         self.dynamic_preview_ebo = None
         self.dynamic_preview_index_count = 0
         self.setup_dynamic_preview_objects()
+
+        # Avoid camera jump on click: start orbit/pan only after tiny drag
+        self.drag_threshold_pixels = 3
+        self._orbit_drag_accum = 0.0
+        self._pan_drag_accum = 0.0
+        self._orbit_active = False
+        self._pan_active = False
 
 
     def generate_draped_path_vertices(self):
@@ -235,6 +246,8 @@ class App:
         while True:
             dt = self.clock.tick(60) / 1000.0
             if self.handle_events_and_inputs(dt) is False: break
+            # Stream chunks around camera target for infinite world
+            streaming.update_streaming(self.world, self.camera.target)
             self.process_meshing_results()
             self.render_scene()
         self.quit()
@@ -253,6 +266,12 @@ class App:
         # Önce tüm Pygame olaylarını işleyip ImGui'ye bildiriyoruz.
         # Bu, io.key_ctrl gibi durumların güncellenmesini sağlar.
         # Sadece bir kez tetiklenmesi gereken eylemler (tuşa basma anı gibi) burada ele alınır.
+        # Not: Aşağıdaki projection_matrix hesaplaması, fare olayları sırasında
+        # ray hesaplamalarında kullanılıyor. Önceden yalnızca orta tuş basıldığında
+        # oluşturulduğu için diğer tuş olaylarında UnboundLocalError oluşuyordu.
+        projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(
+            45, self.screen_size[0] / self.screen_size[1], 0.1, 1000
+        )
         for event in pygame.event.get():
             if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
                 self.meshing_request_queue.put(None)
@@ -264,6 +283,10 @@ class App:
                 self.screen_size = (event.w, event.h)
                 glViewport(0, 0, event.w, event.h)
                 self.io.display_size = self.screen_size
+                # Ekran boyutu değiştiğinde projeksiyon matrisini güncelle
+                projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(
+                    45, self.screen_size[0] / self.screen_size[1], 0.1, 1000
+                )
             
             # Geri Alma/Yineleme (Ctrl+Z/Y basılma anı)
             if event.type == pygame.KEYDOWN:
@@ -284,23 +307,43 @@ class App:
             if not self.io.want_capture_mouse:
                 if event.type == pygame.MOUSEWHEEL:
                     inversion_settings = self.editor.get_inversion_settings()
-                    self.camera.process_zoom(event.y, inversion_settings["zoom"])
-                
+                    if self.io.key_ctrl:
+                        step = event.y
+                        if inversion_settings["zoom"]: step *= -1
+                        move_amount = step * 0.1 * self.camera.distance * getattr(self.camera, "pan_speed_factor", 1.0)
+                        self.camera.target += self.camera.front * move_amount
+                        self.camera.update_camera_vectors()
+                    else:
+                        self.camera.process_zoom(event.y, inversion_settings["zoom"])
                 if event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 2:  # Orta fare tuşu
                         if self.io.key_ctrl:
                             self.camera_panning = True
+                            self._pan_drag_accum = 0.0
+                            self._pan_active = False
                         else:
                             self.camera_orbiting = True
+                            self._orbit_drag_accum = 0.0
+                            self._orbit_active = False
                         pygame.mouse.get_rel()  # Göreceli hareketi sıfırla
-                    
-                    projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
+                        pygame.event.set_grab(True)
+                        pygame.mouse.set_visible(False)
+                        pygame.mouse.get_rel()  # Greceli hareketi sıfırla
+                        # Orbit/pan başlatıldığında pivotu imlecin altındaki araziye sabitle (yalnızca ORBIT)
+                        if not self.io.key_ctrl:
+                                if self.editor.get_camera_options().get("orbit_to_cursor", False):
+                                    projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
+                                    ray_params = self.camera.get_ray_from_mouse(pygame.mouse.get_pos(), self.screen_size[0], self.screen_size[1], projection_matrix)
+                                    pivot_pos = self.world.raycast_terrain(*ray_params)
+                                    if pivot_pos is not None:
+                                        # Sadece hareket başladıktan sonra uygulamak için beklet
+                                        self.pending_orbit_pivot = pivot_pos
                     ray_params = self.camera.get_ray_from_mouse(pygame.mouse.get_pos(), self.screen_size[0], self.screen_size[1], projection_matrix)
                     cursor_pos = self.world.raycast_terrain(*ray_params)
                     
                     if cursor_pos is not None:
                         selected_tool = self.editor.get_selected_tool()
-                        
+                        ""
                         # Sol Tık Olayları
                         if event.button == 1:
                             if selected_tool == "river":
@@ -313,8 +356,9 @@ class App:
                                 self.slope_memory_normal = self.world.get_normal_at_world_pos(cursor_pos.x, cursor_pos.z)
                                 print(f"Eğim Kopyalandı! Normal: {self.slope_memory_normal}")
                             else:
-                                chunk = self.world.get_chunk_at_world_pos(cursor_pos.x, cursor_pos.z)
-                                if chunk: self.current_action = EditAction(chunk)
+                                # Ensure the chunk exists where we start editing
+                                chunk = streaming.ensure_chunk_at_world_pos(self.world, cursor_pos.x, cursor_pos.z)
+                                if chunk: self.current_action = EditAction()
                                 self.stroke_start_pos = cursor_pos
                                 if selected_tool == "flatten":
                                     self.flatten_target_height = cursor_pos.y - 0.1
@@ -329,6 +373,11 @@ class App:
                     if event.button == 2:  # Orta fare tuşu
                         self.camera_orbiting = False
                         self.camera_panning = False
+                        self.pending_orbit_pivot = None
+                        self._orbit_active = False
+                        self._pan_active = False
+                        pygame.event.set_grab(False)
+                        pygame.mouse.set_visible(True)
                     if event.button == 1:
                         if self.current_action:
                             self.undo_manager.register_action(self.current_action)
@@ -347,6 +396,38 @@ class App:
         
         # --- 4. Adım: Arayüzü Çiz ---
         ui_action = self.editor.draw_ui()
+        # Kamera hiz ayarlarini Editor'den uygula
+        speeds = self.editor.get_control_speeds()
+        self.camera.sensitivity = speeds["orbit"]
+        self.camera.zoom_sensitivity = speeds["zoom"]
+        self.camera.pan_speed_factor = speeds["pan"]
+
+        # --- Hover Info HUD (Top-Right) ---
+        # Shows camera target, cursor position and chunk coords
+        info_width, info_height = 260, 90
+        pos_x = self.screen_size[0] - info_width - 10
+        pos_y = 10
+        imgui.set_next_window_position(pos_x, pos_y, imgui.ALWAYS)
+        imgui.set_next_window_size(info_width, info_height, imgui.ALWAYS)
+        flags = imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE | imgui.WINDOW_NO_TITLE_BAR
+        imgui.begin("Konum Bilgisi", flags=flags)
+
+        cam_t = self.camera.target
+        cam_chunk_x = int(np.floor(cam_t.x / CHUNK_WIDTH))
+        cam_chunk_z = int(np.floor(cam_t.z / CHUNK_DEPTH))
+        imgui.text(f"Hedef: x={cam_t.x:.1f} y={cam_t.y:.1f} z={cam_t.z:.1f}")
+        imgui.text(f"Hedef Chunk: ({cam_chunk_x}, {cam_chunk_z})")
+
+        if self.cursor_pos is not None:
+            cur = self.cursor_pos
+            cur_chunk_x = int(np.floor(cur.x / CHUNK_WIDTH))
+            cur_chunk_z = int(np.floor(cur.z / CHUNK_DEPTH))
+            imgui.text(f"İmleç: x={cur.x:.1f} y={cur.y:.1f} z={cur.z:.1f}")
+            imgui.text(f"İmleç Chunk: ({cur_chunk_x}, {cur_chunk_z})")
+        else:
+            imgui.text("İmleç: -")
+
+        imgui.end()
 
         # Arayüzden gelen buton eylemlerini işle
         if ui_action == "clear_river_path":
@@ -358,7 +439,7 @@ class App:
             if len(self.river_path_points) > 1:
                 chunk = self.world.chunks.get((0,0,0)) # Tek chunk varsayımı
                 if chunk:
-                    action = EditAction(chunk)
+                    action = EditAction()
                     # Dere oyma işlemi ana noktaları kullanır (bu doğru)
                     self.world.carve_river_along_path(self.river_path_points, self.editor.get_river_settings(), action)
                     self.undo_manager.register_action(action)
@@ -374,7 +455,8 @@ class App:
             mouse_pressed = pygame.mouse.get_pressed()
             projection_matrix = pyrr.matrix44.create_perspective_projection_matrix(45, self.screen_size[0] / self.screen_size[1], 0.1, 1000)
 
-            self.cursor_pos = self.world.raycast_terrain(*self.camera.get_ray_from_mouse(mouse_pos, self.screen_size[0], self.screen_size[1], projection_matrix))
+            if not (self.camera_orbiting or self.camera_panning):
+                self.cursor_pos = self.world.raycast_terrain(*self.camera.get_ray_from_mouse(mouse_pos, self.screen_size[0], self.screen_size[1], projection_matrix))
 
             # Sol fare tuşu basılı tutulurken araziyi değiştir
             if mouse_pressed[0] and self.cursor_pos is not None and self.current_action:
@@ -398,9 +480,24 @@ class App:
                 mouse_rel = pygame.mouse.get_rel()
                 inversion_settings = self.editor.get_inversion_settings()
                 if self.camera_orbiting:
-                    self.camera.process_orbit(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
-                elif self.camera_panning:
-                    self.camera.process_pan(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
+                    # Start orbiting only after a small drag to prevent jump
+                    self._orbit_drag_accum += abs(mouse_rel[0]) + abs(mouse_rel[1])
+                    if not self._orbit_active:
+                        if self._orbit_drag_accum > self.drag_threshold_pixels:
+                            if self.pending_orbit_pivot is not None:
+                                self.camera.retarget_preserve_position(self.pending_orbit_pivot)
+                                self.pending_orbit_pivot = None
+                            self._orbit_active = True
+                    if self._orbit_active:
+                        self.camera.process_orbit(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
+                if self.camera_panning:
+                    # Start panning only after a small drag
+                    self._pan_drag_accum += abs(mouse_rel[0]) + abs(mouse_rel[1])
+                    if not self._pan_active:
+                        if self._pan_drag_accum > self.drag_threshold_pixels:
+                            self._pan_active = True
+                    if self._pan_active:
+                        self.camera.process_pan(mouse_rel[0], mouse_rel[1], inversion_settings["x"], inversion_settings["y"])
             
         return True
 
@@ -559,3 +656,5 @@ if __name__ == "__main__":
     app = App()
     app.setup_river_path_renderer()
     app.run()
+
+

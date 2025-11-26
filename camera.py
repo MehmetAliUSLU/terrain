@@ -25,6 +25,30 @@ class Camera:
 
         self.update_camera_vectors()
 
+    def retarget_preserve_position(self, new_target: pyrr.Vector3):
+        """
+        Change orbit target to new_target but keep the current camera position
+        by recalculating yaw, pitch, and distance from the new target.
+        """
+        # Vector from new target to current position
+        offset = self.position - new_target
+        dx, dy, dz = float(offset.x), float(offset.y), float(offset.z)
+        dist = float(np.linalg.norm([dx, dy, dz]))
+        if dist < 1e-6:
+            # Avoid degenerate case; keep a tiny distance in front
+            dist = max(0.001, self.distance)
+            dx = dist; dy = 0.0; dz = 0.0
+
+        # Compute spherical angles to match current position around new target
+        rad_pitch = float(np.arcsin(np.clip(dy / dist, -1.0, 1.0)))
+        rad_yaw = float(np.arctan2(dz, dx))
+
+        self.target = pyrr.Vector3([new_target.x, new_target.y, new_target.z])
+        self.distance = dist
+        self.pitch = np.degrees(rad_pitch)
+        self.yaw = np.degrees(rad_yaw)
+        self.update_camera_vectors()
+
     def get_view_matrix(self):
         # Her zaman hedefe bak
         return pyrr.matrix44.create_look_at(self.position, self.target, self.up)
@@ -70,6 +94,8 @@ class Camera:
         if invert_y: dy *= -1
         
         pan_speed = 0.002 * self.distance
+        if hasattr(self, "pan_speed_factor"):
+            pan_speed *= self.pan_speed_factor
         self.target -= self.right * dx * pan_speed
         self.target += self.up * dy * pan_speed # Pan Y yönü genellikle ters hissettirir, bu yüzden + yapıyoruz
         

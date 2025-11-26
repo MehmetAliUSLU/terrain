@@ -106,3 +106,16 @@ void main()
     FragColor = vec4(1.0, 0.0, 0.0, 0.5); // Yarı saydam kırmızı renk
 }
 """
+
+# --- Streaming & Noise Settings ---
+# Number of chunk rings to render around the camera (square radius)
+RENDER_DISTANCE = 2
+# Unload chunks beyond this radius from the camera
+UNLOAD_DISTANCE = 3
+
+# Procedural terrain noise parameters
+TERRAIN_SCALE = 100.0
+NOISE_OCTAVES = 6
+NOISE_PERSISTENCE = 0.5
+NOISE_LACUNARITY = 2.0
+HEIGHT_SCALE = 6.0
