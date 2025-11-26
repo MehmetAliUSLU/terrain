@@ -37,8 +37,8 @@ A powerful 3D terrain editing tool built with Python, Pygame, and OpenGL. This a
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/yourusername/terrain-editor.git
-    cd terrain-editor
+    git clone https://github.com/MehmetAliUSLU/terrain
+    cd terrain
     ```
 
 2.  **Install dependencies:**
